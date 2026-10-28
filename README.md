@@ -1,5 +1,11 @@
 # QAC v7.12.0 — Quick Astrometry for FITS Images
 
+<p align="center">
+  <img src="images/example_badpointing.png" alt="Example of astrometry of a field with bad pointing" width="600">
+</p>
+
+
+
 Author: Andrea Rossi, with the assistance of ChatGPT.  
 License: [MIT](LICENSE).
 
