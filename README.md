@@ -3,7 +3,7 @@
 <p align="center">
   <img src="images/example_badpointing.png" 
     alt="Example of astrometry of a field with bad pointing" 
-    width="600">
+    width="700">
     <br>
   <em> Example of astrometry of a field with bad pointing </em>
 </p>
