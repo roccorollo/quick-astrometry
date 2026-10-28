@@ -2,8 +2,8 @@
 
 <p align="center">
   <img src="images/example_badpointing.png" alt="Example of astrometry of a field with bad pointing" width="600">
+  <em> Example of astrometry of a field with bad pointing </em>
 </p>
-
 
 
 Author: Andrea Rossi, with the assistance of ChatGPT.  
