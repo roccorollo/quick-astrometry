@@ -8,14 +8,18 @@ from __future__ import annotations
 
 import argparse
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import io
+from itertools import combinations, permutations
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
+import textwrap
 import warnings
 
 import numpy as np
@@ -33,9 +37,14 @@ from astropy.wcs.utils import fit_wcs_from_points
 from erfa import ErfaWarning
 from photutils.background import Background2D, MedianBackground
 from photutils.detection import DAOStarFinder
+from photutils.segmentation import SourceCatalog, detect_sources as segment_sources
 
-VERSION = "0.5.11"
+# Release identity and catalogue/matching defaults.
+VERSION = "7.12.0"
 MIN_MATCHES = 8
+DEFAULT_STAR_FWHM = 3.0
+# Distinguish an image-derived stellar FWHM from a fixed value or the default retry.
+ESTIMATE_STAR_FWHM = object()
 DEFAULT_BRIGHT_MAG = 12.0
 GAIA_DEFAULT_FAINT_MAG = 20.0
 # The ESA Gaia synchronous TAP endpoint returns at most 2000 rows.
@@ -43,8 +52,58 @@ GAIA_ROW_LIMIT = 2000
 GAIA_COLUMNS = {'G': 'phot_g_mean_mag', 'BP': 'phot_bp_mean_mag', 'RP': 'phot_rp_mean_mag'}
 TWOMASS_COLUMNS = {'J': 'Jmag', 'H': 'Hmag', 'KS': 'Kmag'}
 TWOMASS_DEFAULT_LIMITS = {'J': 15.8, 'H': 15.1, 'KS': 14.3}
+# Catalogue-specific magnitude defaults are selection cuts, not promised completeness limits.
+ALLWISE_COLUMNS = {f'W{band}': f'W{band}mag' for band in range(1, 5)}
+ALLWISE_BRIGHT_LIMITS = {'W1': 8., 'W2': 7., 'W3': 4., 'W4': 0.}
+ALLWISE_FAINT_LIMITS = {'W1': 16., 'W2': 15., 'W3': 11., 'W4': 8.}
+UCAC5_COLUMNS = {'G': 'Gmag', 'R': 'Rmag', 'J': 'Jmag', 'H': 'Hmag', 'KS': 'Kmag'}
+UCAC5_BRIGHT_LIMIT = 8.
+UCAC5_FAINT_LIMITS = {'G': 16., 'R': 16., **TWOMASS_DEFAULT_LIMITS}
+CATALOG_ALIASES = {'ps': 'ps1', 'aw': 'allwise', 'uc': 'ucac5', 'gsc': 'gsc3.3'}
+VIZIER_ROW_LIMIT = 10000
+GSC_ROW_LIMIT = 10000
+GSC_API = 'https://gsss.stsci.edu/webservices/vo/CatalogSearch.aspx'
+# Share PS1 magnitude defaults between validation, direct construction, and CLI provider selection.
+PS1_DEFAULT_BRIGHT_MAG = 15.0
+PS1_DEFAULT_FAINT_MAG = 21.0
 PS1_BANDS = ('g', 'r', 'i', 'z', 'y')
 PS1_API = 'https://catalogs.mast.stsci.edu/api/v0.1/panstarrs/dr2/mean.csv'
+
+# Use identical projected reference-window boundaries for selection and covering-cone calculations.
+CATALOG_WINDOW_MARGIN = .3
+
+# Bound triangle seeding while leaving correspondence refinement and scientific acceptance unchanged.
+MATCH_METHODS = ('pair', 'triangle', 'scamp')
+TRIANGLE_NEIGHBORS = 5
+TRIANGLE_BRIGHT_LIMIT = 24
+TRIANGLE_RATIO_TOLERANCE = .01
+TRIANGLE_MAX_CANDIDATES = 2000
+TRIANGLE_MIN_AREA_RATIO = .02
+TRIANGLE_PERMUTATIONS = tuple(permutations(range(3)))
+# Both seed algorithms exclude edges shorter than the existing pair-matching separation, in pixels.
+MIN_SEED_SEPARATION = 12.0
+
+
+# Match the standalone finding-chart auto display's light sky and asinh contrast.
+PLOT_SCALING_SAMPLE = 1_000_000
+PLOT_MIN_SKY_BRIGHTNESS = .70
+PLOT_TARGET_SKY_BRIGHTNESS = .75
+PLOT_ASINH_A = .08
+
+# Keep image tiles and per-frame statistics readable when many frames are selected.
+PLOT_FRAMES_PER_PAGE = 6
+
+# Identify substantial requested-coordinate offsets relative to the shorter angular field span.
+POINTING_OFFSET_THRESHOLD = .05
+POINTING_COLOR = '#e07800'
+
+# Keep recovery displacements independent of trial order and relative to the original field centre.
+BAD_POINTING_FRACTION = .5
+BAD_POINTING_BEARINGS = (('N', 0.), ('E', 90.), ('S', 180.), ('W', 270.))
+
+# Reserve red for failures while keeping successful frame colours stable across pages.
+PLOT_FRAME_COLORS = ('#1f77b4', '#ff7f0e', '#2ca02c', '#9467bd',
+                     '#8c564b', '#17becf', '#bcbd22', '#7f7f7f')
 
 
 @dataclass(frozen=True)
@@ -72,8 +131,47 @@ class QACError(Exception):
     """A recoverable failure with a useful message for the user."""
 
 
+# Distinguish too few detected stars from unusable image data when choosing retries.
+class InsufficientSources(QACError):
+    """A different stellar FWHM guess may recover enough image sources."""
+
+
 class CatalogUnavailable(QACError):
     """A wider search cannot fix a service or catalogue access failure."""
+
+
+# Configure the independent FFT seed strategy; bin widths and smoothing are numerical matching choices, not errors.
+@dataclass(frozen=True)
+class ScampConfig:
+    max_sources: int | None = None
+    max_references: int = 180
+    log_bins: int = 512
+    angle_bins: int = 512
+    position_bins: int = 512
+    low_sigma: float = .8
+    high_sigma: float = 6.
+    pair_peaks: int = 8
+    position_peaks: int = 3
+    peak_radius: int = 4
+
+    # Bound memory and pair-generation cost before allocating histograms or running FFTs.
+    def __post_init__(self):
+        for name in ('max_sources', 'max_references'):
+            value = getattr(self, name)
+            if value is None and name == 'max_sources':
+                continue
+            if not isinstance(value, (int, np.integer)) or not MIN_MATCHES <= value <= 2000:
+                raise QACError(f'SCAMP {name} must be an integer between {MIN_MATCHES} and 2000')
+        for name in ('log_bins', 'angle_bins', 'position_bins'):
+            value = getattr(self, name)
+            if not isinstance(value, (int, np.integer)) or not 32 <= value <= 1024:
+                raise QACError(f'SCAMP {name} must be an integer between 32 and 1024')
+        if not np.isfinite([self.low_sigma, self.high_sigma]).all() or not 0 < self.low_sigma < self.high_sigma:
+            raise QACError('SCAMP smoothing widths must be finite, positive, and low_sigma < high_sigma')
+        for name in ('pair_peaks', 'position_peaks', 'peak_radius'):
+            value = getattr(self, name)
+            if not isinstance(value, (int, np.integer)) or not 1 <= value <= 32:
+                raise QACError(f'SCAMP {name} must be an integer between 1 and 32')
 
 
 @dataclass(frozen=True)
@@ -99,11 +197,115 @@ class ReferenceCatalog:
     label: str
 
 
+# Retain the accepted correspondences and existing validation score for plotting.
+@dataclass
+class MatchDiagnostics:
+    source_indices: np.ndarray | None = None
+    reference_sky: SkyCoord | None = None
+    validation_rms: float | None = None
+
+
+# Keep each solved frame's small diagnostic sample until output pixels are ready.
+@dataclass
+class FrameDiagnostics:
+    sources: np.ndarray
+    matches: MatchDiagnostics
+    catalog_label: str
+    reference_count: int
+    obstime: Time | None
+    requested_center: SkyCoord | None = None
+
+
+# Describe a selected output frame with either calibration data or an explicit failure.
+@dataclass
+class DiagnosticFrame:
+    frame: Frame
+    number: int
+    image: np.ndarray
+    display_wcs: WCS | None
+    solution: WCS | None
+    data: FrameDiagnostics | None
+    failure: str | None = None
+
+
+# Expose complete/partial run status without changing the solver's returned output path.
+@dataclass
+class SolveStatus:
+    selected: int = 0
+    solved: int = 0
+    failures: dict[Frame, str] = field(default_factory=dict)
+
+
 class CatalogProvider:
     def query(self, center: SkyCoord, radius: u.Quantity, obstime: Time | None) -> ReferenceCatalog:
         raise NotImplementedError
 
 
+# Resolve the same default bright cut during CLI validation and provider construction.
+def catalog_bright_limit(catalog: str, band: str | None) -> float:
+    # Keep CLI validation and provider selection on the same magnitude-default policy.
+    if catalog == 'allwise':
+        return ALLWISE_BRIGHT_LIMITS.get((band or 'W1').upper(), 8.)
+    if catalog == 'ucac5':
+        return UCAC5_BRIGHT_LIMIT
+    return PS1_DEFAULT_BRIGHT_MAG if catalog == 'ps1' else DEFAULT_BRIGHT_MAG
+
+
+# Share VizieR transport and truncation checks without mixing catalogue-specific scientific filters.
+def query_vizier(center: SkyCoord, radius: u.Quantity, *, catalog: str,
+                  columns: list[str], filters: dict[str, str], label: str) -> Table:
+    # Load the remote client only when a VizieR catalogue is actually requested.
+    from astroquery.vizier import Vizier
+
+    # Reject capped responses rather than fitting an undocumented subset of a dense field.
+    vizier = Vizier(columns=columns, column_filters=filters, row_limit=VIZIER_ROW_LIMIT)
+    try:
+        tables = vizier.query_region(center, radius=radius, catalog=catalog)
+    except Exception as exc:
+        raise CatalogUnavailable(f'{label} query failed: {exc}') from exc
+    if not tables or len(tables[0]) == 0:
+        raise QACError(f'{label} returned no reference stars')
+    if len(tables[0]) >= VIZIER_ROW_LIMIT:
+        raise CatalogUnavailable(f'{label} query reached its {VIZIER_ROW_LIMIT:,}-row limit; '
+                                 'choose a narrower -m range or a smaller field')
+    return tables[0]
+
+
+# Read masked catalogue numbers in documented units, converting supplied compatible column units.
+def catalog_numbers(table: Table, name: str, unit: u.Unit | None = None) -> np.ndarray:
+    # Missing values remain NaN rather than becoming usable coordinates or magnitudes.
+    if name not in table.colnames:
+        raise QACError(f'Catalogue response lacks required column {name}')
+    values = np.ma.filled(np.ma.asarray(table[name], dtype=float), np.nan)
+    if unit is not None and table[name].unit is not None:
+        try:
+            values = (values*u.Unit(table[name].unit)).to_value(unit)
+        except (ValueError, TypeError) as exc:
+            raise QACError(f'Catalogue column {name} has incompatible units: {table[name].unit}') from exc
+    return np.asarray(values)
+
+
+# Reuse the existing Gaia angular-motion calculation for catalogues with genuine proper motions.
+def propagate_catalog_positions(sky: SkyCoord, pmra: np.ndarray, pmdec: np.ndarray,
+                                 epoch: Time, obstime: Time | None) -> SkyCoord:
+    # Keep the catalogue epoch unless an observing date and usable angular motion are available.
+    if obstime is None:
+        return sky
+    moving = np.isfinite(pmra) & np.isfinite(pmdec)
+    if not moving.any():
+        return sky
+    # Missing distance is intentional: only angular proper motion is propagated, without parallax.
+    old = SkyCoord(sky.ra[moving], sky.dec[moving], pm_ra_cosdec=pmra[moving]*u.mas/u.yr,
+                   pm_dec=pmdec[moving]*u.mas/u.yr, obstime=epoch, frame='icrs')
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message='.*distance overridden.*', category=ErfaWarning)
+        propagated = old.apply_space_motion(new_obstime=obstime)
+    ra, dec = sky.ra.deg.copy(), sky.dec.deg.copy()
+    ra[moving], dec[moving] = propagated.ra.deg, propagated.dec.deg
+    return SkyCoord(ra*u.deg, dec*u.deg, frame='icrs')
+
+
+# Query Gaia DR3 and propagate its positions with the shared angular-motion helper.
 class GaiaDR3(CatalogProvider):
     def __init__(self, band: str = 'RP', mag_limit: float | None = None,
                  min_mag: float = DEFAULT_BRIGHT_MAG, refresh: bool = False):
@@ -184,20 +386,8 @@ class GaiaDR3(CatalogProvider):
         valid = (np.isfinite(ra) & np.isfinite(dec) & np.isfinite(mag) &
                  (mag >= self.min_mag) & (mag < upper))
         sky = SkyCoord(ra[valid] * u.deg, dec[valid] * u.deg, frame='icrs')
-        if obstime is not None:
-            moving = np.isfinite(pmra[valid]) & np.isfinite(pmdec[valid])
-            if moving.any():
-                old = SkyCoord(ra[valid][moving] * u.deg, dec[valid][moving] * u.deg,
-                               pm_ra_cosdec=pmra[valid][moving] * u.mas/u.yr,
-                               pm_dec=pmdec[valid][moving] * u.mas/u.yr,
-                               obstime=Time(2016.0, format='jyear'), frame='icrs')
-                with warnings.catch_warnings():
-                    # No parallax/distance is needed for angular propagation.
-                    warnings.filterwarnings('ignore', message='.*distance overridden.*', category=ErfaWarning)
-                    propagated = old.apply_space_motion(new_obstime=obstime)
-                rr, dd = sky.ra.deg.copy(), sky.dec.deg.copy()
-                rr[moving], dd[moving] = propagated.ra.deg, propagated.dec.deg
-                sky = SkyCoord(rr*u.deg, dd*u.deg, frame='icrs')
+        sky = propagate_catalog_positions(sky, pmra[valid], pmdec[valid],
+                                           Time(2016.0, format='jyear'), obstime)
         return ReferenceCatalog(sky, mag[valid], f'Gaia DR3 ({self.band})')
 
 
@@ -211,8 +401,6 @@ class TwoMASS(CatalogProvider):
         self._memory_cache = {}
 
     def query(self, center: SkyCoord, radius: u.Quantity, obstime: Time | None) -> ReferenceCatalog:
-        from astroquery.vizier import Vizier
-
         column = TWOMASS_COLUMNS[self.band]
         limit = self.mag_limit if self.mag_limit is not None else TWOMASS_DEFAULT_LIMITS[self.band]
         key = (center.ra.deg, center.dec.deg, radius.to_value(u.deg),
@@ -222,17 +410,9 @@ class TwoMASS(CatalogProvider):
         band_label = 'Ks' if self.band == 'KS' else self.band
         print(f"  Querying 2MASS ({self.min_mag:g} <= {band_label} < {limit:g}, "
               f"radius {radius.to_value(u.arcmin):.1f} arcmin) ...", flush=True)
-        vizier = Vizier(columns=['_RAJ2000', '_DEJ2000', column],
-                        column_filters={column: f'{self.min_mag:g}..{limit:g}'}, row_limit=10000)
-        try:
-            tables = vizier.query_region(center, radius=radius, catalog='II/246/out')
-        except Exception as exc:
-            raise CatalogUnavailable(f"2MASS query failed: {exc}") from exc
-        if not tables:
-            raise QACError(f"2MASS returned no {self.band}-selected reference stars")
-        table = tables[0]
-        if len(table) >= 10000:
-            raise CatalogUnavailable("2MASS query reached its 10,000-row limit; choose a narrower -m range or a smaller field")
+        table = query_vizier(center, radius, catalog='II/246/out',
+                              columns=['_RAJ2000', '_DEJ2000', column],
+                              filters={column: f'{self.min_mag:g}..{limit:g}'}, label='2MASS')
         ra_key = '_RAJ2000' if '_RAJ2000' in table.colnames else 'RAJ2000'
         dec_key = '_DEJ2000' if '_DEJ2000' in table.colnames else 'DEJ2000'
         if not {ra_key, dec_key, column}.issubset(table.colnames):
@@ -254,14 +434,125 @@ class TwoMASS(CatalogProvider):
         return result
 
 
+# Select reliable, unblended AllWISE stationary positions; its apparent motions are not proper motions.
+class AllWISE(CatalogProvider):
+    # Set band-specific magnitude cuts and retain results for repeated frame/retry cones.
+    def __init__(self, band: str = 'W1', mag_limit: float | None = None,
+                 min_mag: float | None = None):
+        # Store selection cuts separately from the cached stationary reference positions.
+        self.band = band
+        self.mag_limit = ALLWISE_FAINT_LIMITS[band] if mag_limit is None else mag_limit
+        self.min_mag = ALLWISE_BRIGHT_LIMITS[band] if min_mag is None else min_mag
+        self._memory_cache = {}
+
+    # Keep only clean point sources with reliable selected-band and W1 detections.
+    def query(self, center: SkyCoord, radius: u.Quantity, obstime: Time | None) -> ReferenceCatalog:
+        # Include every selection setting so reused references cannot silently become stale.
+        key = (center.ra.deg, center.dec.deg, radius.to_value(u.deg),
+               self.band, self.min_mag, self.mag_limit)
+        if key in self._memory_cache:
+            return self._memory_cache[key]
+        column = ALLWISE_COLUMNS[self.band]
+        index = int(self.band[1])-1
+        columns = ['RAJ2000', 'DEJ2000', column, 'eeMaj', 'qph', 'ccf', 'ex', 'nb', 'na',
+                   'sat1', f'sat{index+1}']
+        print(f'  Querying AllWISE ({self.min_mag:g} <= {self.band} < {self.mag_limit:g}, '
+              f'radius {radius.to_value(u.arcmin):.1f} arcmin; stationary positions) ...', flush=True)
+        table = query_vizier(center, radius, catalog='II/328/allwise',
+                              columns=list(dict.fromkeys(columns)),
+                              filters={column: f'{self.min_mag:g}..{self.mag_limit:g}'}, label='AllWISE')
+        if not set(columns).issubset(table.colnames):
+            raise QACError('AllWISE response lacks required position, photometry, or quality columns')
+        # Interpret native stationary coordinates and the formal error-ellipse major axis.
+        ra = catalog_numbers(table, 'RAJ2000', u.deg)
+        dec = catalog_numbers(table, 'DEJ2000', u.deg)
+        mag = catalog_numbers(table, column)
+        error = catalog_numbers(table, 'eeMaj', u.arcsec)
+        # Require quality A in W1 and the selected band; never treat upper-limit photometry as a star.
+        quality = np.asarray(np.ma.filled(table['qph'], ''), dtype=str)
+        artifacts = np.asarray(np.ma.filled(table['ccf'], ''), dtype=str)
+        clean = np.array([len(q) == 4 and len(c) == 4 and q[0] == q[index] == 'A'
+                          and c[0] == c[index] == '0' for q, c in zip(quality, artifacts, strict=True)])
+        valid = (np.isfinite(ra) & np.isfinite(dec) & (ra >= 0) & (ra < 360) & (np.abs(dec) <= 90)
+                 & np.isfinite(mag) & (mag >= self.min_mag) & (mag < self.mag_limit)
+                 & np.isfinite(error) & (error > 0) & (error <= .3) & clean
+                 & (catalog_numbers(table, 'ex') == 0) & (catalog_numbers(table, 'nb') == 1)
+                 & (catalog_numbers(table, 'na') == 0) & (catalog_numbers(table, 'sat1') == 0)
+                 & (catalog_numbers(table, f'sat{index+1}') == 0))
+        if not valid.any():
+            raise QACError(f'AllWISE returned no usable {self.band}-selected reference stars after quality cuts')
+        result = ReferenceCatalog(SkyCoord(ra[valid]*u.deg, dec[valid]*u.deg, frame='icrs'),
+                                  mag[valid], f'AllWISE ({self.band}, stationary)')
+        self._memory_cache[key] = result
+        return result
+
+
+# Use UCAC5's Gaia DR1 positions at J2015.0 with UCAC/Gaia proper motions, not its older UCAC epochs.
+class UCAC5(CatalogProvider):
+    # Set the photometric selection and cache separately for each observation epoch.
+    def __init__(self, band: str = 'G', mag_limit: float | None = None,
+                 min_mag: float = UCAC5_BRIGHT_LIMIT):
+        # Store selection cuts and keep propagated results separate for different observing dates.
+        self.band = band
+        self.mag_limit = UCAC5_FAINT_LIMITS[band] if mag_limit is None else mag_limit
+        self.min_mag = min_mag
+        self._memory_cache = {}
+
+    # Propagate only usable proper motions, rejecting missing values rather than assuming zero motion.
+    def query(self, center: SkyCoord, radius: u.Quantity, obstime: Time | None) -> ReferenceCatalog:
+        # Reuse references only when both the cone and physical observation epoch are identical.
+        key = (center.ra.deg, center.dec.deg, radius.to_value(u.deg),
+               self.band, self.min_mag, self.mag_limit,
+               None if obstime is None else float(obstime.tt.jd))
+        if key in self._memory_cache:
+            return self._memory_cache[key]
+        column = UCAC5_COLUMNS[self.band]
+        print(f'  Querying UCAC5 ({self.min_mag:g} <= {self.band} < {self.mag_limit:g}, '
+              f'radius {radius.to_value(u.arcmin):.1f} arcmin) ...', flush=True)
+        table = query_vizier(center, radius, catalog='I/340/ucac5',
+                              columns=['RAgaia', 'DEgaia', column, 'e_RAgaia', 'e_DEgaia',
+                                       'pmRA', 'pmDE', 'e_pmRA', 'e_pmDE'],
+                              filters={column: f'{self.min_mag:g}..{self.mag_limit:g}'}, label='UCAC5')
+        # Read the native J2015.0 coordinates, not VizieR's computed or older-epoch UCAC positions.
+        ra, dec = catalog_numbers(table, 'RAgaia', u.deg), catalog_numbers(table, 'DEgaia', u.deg)
+        mag = catalog_numbers(table, column)
+        pmra = catalog_numbers(table, 'pmRA', u.mas/u.yr)
+        pmdec = catalog_numbers(table, 'pmDE', u.mas/u.yr)
+        valid = (np.isfinite(ra) & np.isfinite(dec) & (ra >= 0) & (ra < 360) & (np.abs(dec) <= 90)
+                 & np.isfinite(mag) & (mag >= self.min_mag) & (mag < self.mag_limit))
+        # Original R/J/H/K photometry uses 0 and 30 as missing-data placeholders.
+        if self.band != 'G':
+            valid &= ~np.isin(mag, (0., 30.))
+        # These are catalogue-quality cuts, not invented fit weights or a full propagated covariance.
+        for name, unit, upper in (('e_RAgaia', u.mas, 300.), ('e_DEgaia', u.mas, 300.),
+                                  ('e_pmRA', u.mas/u.yr, 10.), ('e_pmDE', u.mas/u.yr, 10.)):
+            error = catalog_numbers(table, name, unit)
+            valid &= np.isfinite(error) & (error >= 0) & (error <= upper)
+        if obstime is not None:
+            valid &= np.isfinite(pmra) & np.isfinite(pmdec)
+        if not valid.any():
+            raise QACError(f'UCAC5 returned no usable {self.band}-selected reference stars after quality cuts')
+        # Propagate accepted positions with genuine proper motions; retain J2015.0 if undated.
+        sky = SkyCoord(ra[valid]*u.deg, dec[valid]*u.deg, frame='icrs')
+        sky = propagate_catalog_positions(sky, pmra[valid], pmdec[valid],
+                                           Time(2015.0, format='jyear'), obstime)
+        if obstime is None:
+            print('  WARNING: no observation date; UCAC5 positions retained at J2015.0.', flush=True)
+        result = ReferenceCatalog(sky, mag[valid], f'UCAC5 ({self.band}, '
+                                  f'{"J2015.0" if obstime is None else "propagated"})')
+        self._memory_cache[key] = result
+        return result
+
+
+# Query Gaia-corrected PS1 mean positions with catalogue-specific reliability checks.
 class PanSTARRS1(CatalogProvider):
     """Gaia EDR3-corrected PS1 DR2 single-epoch mean astrometry from MAST."""
 
     PAGE_SIZE = 5000
     MAX_ROWS = 50000
 
-    def __init__(self, band: str = 'r', mag_limit: float = 21.0,
-                 min_mag: float = 15.0):
+    def __init__(self, band: str = 'r', mag_limit: float = PS1_DEFAULT_FAINT_MAG,
+                 min_mag: float = PS1_DEFAULT_BRIGHT_MAG):
         self.band = band
         self.mag_limit = mag_limit
         self.min_mag = min_mag
@@ -406,6 +697,82 @@ class PanSTARRS1(CatalogProvider):
         return ReferenceCatalog(sky, mag, f'PS1 DR2 ({self.band}, corrected mean)')
 
 
+# Query MAST's versioned Guide Star Catalog with its native stellar flag and magnitude.
+class GSC33(CatalogProvider):
+    # Keep selection bounds and results for repeated searches in the same run.
+    def __init__(self, mag_limit: float = GAIA_DEFAULT_FAINT_MAG,
+                 min_mag: float = DEFAULT_BRIGHT_MAG):
+        self.mag_limit = mag_limit
+        self.min_mag = min_mag
+        self._memory_cache: dict[tuple, ReferenceCatalog] = {}
+
+    # Parse optional catalogue fields without turning missing values into valid measurements.
+    @staticmethod
+    def _number(row: dict[str, str], key: str) -> float:
+        try:
+            return float(row[key])
+        except (KeyError, ValueError, TypeError):
+            return np.nan
+
+    # Request a bounded cone and reject responses naming a different GSC release.
+    def query(self, center: SkyCoord, radius: u.Quantity,
+              obstime: Time | None) -> ReferenceCatalog:
+        key = (center.ra.deg, center.dec.deg, radius.to_value(u.deg),
+               self.min_mag, self.mag_limit,
+               None if obstime is None else float(obstime.jyear))
+        if key in self._memory_cache:
+            return self._memory_cache[key]
+        params = {'RA': center.ra.deg, 'DEC': center.dec.deg,
+                  'SR': radius.to_value(u.deg), 'CATALOG': 'GSC33',
+                  'FORMAT': 'CSV', 'MAGRANGE': f'{self.min_mag:g},{self.mag_limit:g}',
+                  'MAXOBJ': GSC_ROW_LIMIT}
+        if obstime is not None:
+            params['EPOCH'] = f'{obstime.jyear:.6f}'
+        print(f'  Querying GSC 3.3 ({self.min_mag:g} <= mag < {self.mag_limit:g}, '
+              f'radius {radius.to_value(u.arcmin):.1f} arcmin) ...', flush=True)
+        try:
+            response = requests.get(GSC_API, params=params, timeout=(10, 60))
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise CatalogUnavailable(f'GSC 3.3 query failed: {exc}') from exc
+        # MAST CSV starts with a count line, which may omit the catalogue name.
+        lines = io.StringIO(response.text)
+        status = lines.readline().strip().lstrip('\ufeff')
+        if not re.match(r'^#?Objects found\s*:\s*\d+\b', status, re.I):
+            raise CatalogUnavailable(f'GSC 3.3 returned an invalid count line: {status[:200]}')
+        versions = re.findall(r'\bGSC\d+(?:\.\d+)?\b', status, re.I)
+        if versions and any(version.upper() != 'GSC33' for version in versions):
+            raise CatalogUnavailable(f'GSC 3.3 service returned another release: {status[:200]}')
+        reader = csv.DictReader(lines)
+        required = {'ra', 'dec', 'mag', 'classification'}
+        if not required.issubset(reader.fieldnames or ()):
+            missing = ', '.join(sorted(required - set(reader.fieldnames or ())))
+            raise CatalogUnavailable(f'GSC 3.3 response lacks columns: {missing}')
+        rows = list(reader)
+        if len(rows) >= GSC_ROW_LIMIT:
+            raise CatalogUnavailable(f'GSC 3.3 query reached its {GSC_ROW_LIMIT:,}-row limit; '
+                                     'choose a narrower -m range or a smaller field')
+        if not rows:
+            raise QACError('GSC 3.3 returned no reference stars')
+        # Classification 0 denotes a star; magnitudes are the service's mixed-band mag.
+        good = []
+        for row in rows:
+            ra, dec, mag = (self._number(row, name) for name in ('ra', 'dec', 'mag'))
+            if (self._number(row, 'classification') == 0 and
+                np.isfinite(ra) and 0 <= ra < 360 and
+                np.isfinite(dec) and -90 <= dec <= 90 and
+                np.isfinite(mag) and self.min_mag <= mag < self.mag_limit):
+                good.append((ra, dec, mag))
+        if not good:
+            raise QACError('GSC 3.3 returned no usable stellar positions and magnitudes')
+        values = np.asarray(good)
+        result = ReferenceCatalog(SkyCoord(values[:, 0]*u.deg, values[:, 1]*u.deg,
+                                           frame='icrs'), values[:, 2], 'GSC 3.3 (mag)')
+        self._memory_cache[key] = result
+        return result
+
+
+# Load an offline RA/Dec catalogue and filter it to each requested cone.
 class LocalCatalog(CatalogProvider):
     def __init__(self, path: Path):
         self.path = path
@@ -487,9 +854,10 @@ def select_frames(frames: list[Frame], choice: str | None) -> list[Frame]:
     return selected
 
 
-def image_of(hdul: fits.HDUList, frame: Frame) -> np.ndarray:
+# Return a frame or plane as floating-point analysis data, or preserve its native dtype.
+def image_of(hdul: fits.HDUList, frame: Frame, *, dtype=float) -> np.ndarray:
     data = hdul[frame.hdu].data
-    return np.asarray(data if frame.plane is None else data[frame.plane], dtype=float)
+    return np.asarray(data if frame.plane is None else data[frame.plane], dtype=dtype)
 
 
 def exposure_time(hdul: fits.HDUList, frame: Frame) -> Time | None:
@@ -503,6 +871,7 @@ def exposure_time(hdul: fits.HDUList, frame: Frame) -> Time | None:
     return None
 
 
+# Resolve a selected instrument's scale using the frame's recorded detector binning.
 def instrument_scale(hdul: fits.HDUList, frame: Frame, name: str) -> float:
     """Adjust a preset scale to the image binning when available."""
     preset = INSTRUMENTS[name]
@@ -529,16 +898,20 @@ def instrument_scale(hdul: fits.HDUList, frame: Frame, name: str) -> float:
             raise QACError(f"{frame.label}: invalid detector binning {binning!r}") from exc
         if bx <= 0 or by <= 0 or bx != by:
             raise QACError(f"{frame.label}: instrument preset needs equal positive X/Y binning; "
-                           "supply -s for asymmetric binning")
+                           "supply -ps for asymmetric binning")
         factor = bx / preset.binning
     scale = preset.scale * factor
     print(f"  {name}: initial scale {scale:.4f} arcsec/pixel", flush=True)
     return scale
 
 
+# Apply explicit/preset scale priority while retaining usable header orientation and pointing.
 def initial_wcs(hdul: fits.HDUList, frame: Frame, shape: tuple[int, int],
                 coords: SkyCoord | None, scale: float | None,
                 instrument: str | None = None) -> tuple[WCS, bool]:
+    # Treat every selected preset like an explicit starting scale unless -ps was supplied.
+    if scale is None and instrument is not None:
+        scale = instrument_scale(hdul, frame, instrument)
     header = hdul[frame.hdu].header.copy()
     # A primary HDU may hold pointing keywords for an image extension.
     for key in ('RA', 'DEC', 'OBJRA', 'OBJDEC', 'PIXSCALE', 'SECPIX'):
@@ -598,18 +971,16 @@ def initial_wcs(hdul: fits.HDUList, frame: Frame, shape: tuple[int, int],
         for key in ('PIXSCALE', 'SECPIX'):
             if key in header:
                 scale = float(header[key]); break
-    if scale is None and instrument is not None:
-        scale = instrument_scale(hdul, frame, instrument)
     assumed_scale = scale is None
     if assumed_scale:
         scale = 0.2
         print('\n' + '!'*78)
         print('!!!! WARNING: NO PIXEL SCALE IN THE HEADER OR COMMAND LINE.           !!!!')
         print('!!!! ASSUMING 0.2 ARCSEC/PIXEL. CHECK THE FITTED SCALE CAREFULLY.      !!!!')
-        print('!!!! FOR BEST RESULTS, GIVE THE REAL SCALE WITH -s.                    !!!!')
+        print('!!!! FOR BEST RESULTS, GIVE THE REAL SCALE WITH -ps.                   !!!!')
         print('!'*78 + '\n', flush=True)
     if not np.isfinite(scale) or scale <= 0:
-        raise QACError(f"{frame.label}: invalid pixel scale; give -s ARCSEC_PER_PIXEL")
+        raise QACError(f"{frame.label}: invalid pixel scale; give -ps ARCSEC_PER_PIXEL")
     wcs = WCS(naxis=2)
     wcs.wcs.crpix = [(shape[1]+1)/2, (shape[0]+1)/2]
     wcs.wcs.cd = [[-scale/3600, 0], [0, scale/3600]]
@@ -619,10 +990,12 @@ def initial_wcs(hdul: fits.HDUList, frame: Frame, shape: tuple[int, int],
     return wcs, assumed_scale
 
 
-def detect_sources(image: np.ndarray) -> np.ndarray:
+# Subtract the local sky and estimate pixel noise for both detection and FWHM estimation.
+def source_image(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
     valid = np.isfinite(image)
     if min(image.shape) < 24 or valid.sum() < 100:
         raise QACError("Image too small or contains too few finite pixels")
+    # Use the same background model for the two source-analysis paths.
     try:
         bkg = Background2D(image, box_size=min(64, max(16, min(image.shape)//4)),
                            filter_size=(3, 3), mask=~valid, bkg_estimator=MedianBackground())
@@ -633,12 +1006,46 @@ def detect_sources(image: np.ndarray) -> np.ndarray:
         data = image - med
     if not np.isfinite(sigma) or sigma <= 0:
         raise QACError("Cannot estimate positive image noise")
-    finder = DAOStarFinder(fwhm=3.0, threshold=5*sigma, exclude_border=True)
+    return np.where(valid, data, 0.0), valid, float(sigma)
+
+
+# Estimate a rough stellar FWHM from isolated, round, high-significance sources.
+def estimate_stellar_fwhm(image: np.ndarray) -> tuple[float, int]:
+    data, valid, sigma = source_image(image)
+    # Segment at a lower threshold than detection so stellar wings inform the moments.
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', category=UserWarning)
-        sources = finder(np.where(valid, data, 0.0))
+        segments = segment_sources(data, 3 * sigma, 7, mask=~valid)
+    if segments is None:
+        raise InsufficientSources('No suitable sources for stellar FWHM estimation')
+    catalogue = SourceCatalog(data, segments, mask=~valid)
+    xy = np.asarray(catalogue.centroid, dtype=float)
+    widths = np.asarray(catalogue.fwhm, dtype=float)
+    elongation = np.asarray(catalogue.elongation, dtype=float)
+    peaks = np.asarray(catalogue.max_value, dtype=float)
+    # Reject edge-truncated, elongated, faint, blended, and implausibly broad sources.
+    neighbours = cKDTree(xy).query(xy, k=2)[0][:, 1] if len(xy) > 1 else np.zeros(len(xy))
+    good = np.isfinite(widths) & np.isfinite(elongation) & np.isfinite(peaks)
+    good &= (widths >= 1.5) & (widths <= min(30, min(image.shape) / 6))
+    good &= (elongation < 1.3) & (peaks >= 15 * sigma) & (neighbours > 2 * widths)
+    good &= (xy[:, 0] > widths) & (xy[:, 0] < image.shape[1] - widths)
+    good &= (xy[:, 1] > widths) & (xy[:, 1] < image.shape[0] - widths)
+    selected = widths[good]
+    if len(selected) < 12:
+        raise InsufficientSources(f'Only {len(selected)} suitable stars for stellar FWHM estimation; need at least 12')
+    return float(np.median(selected)), len(selected)
+
+
+# Find star centroids using the supplied approximate stellar FWHM in pixels.
+def detect_sources(image: np.ndarray, fwhm: float = DEFAULT_STAR_FWHM) -> np.ndarray:
+    data, valid, sigma = source_image(image)
+    # Apply the existing DAO finder to the shared sky-subtracted image.
+    finder = DAOStarFinder(fwhm=fwhm, threshold=5*sigma, exclude_border=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', category=UserWarning)
+        sources = finder(data)
     if sources is None or len(sources) < MIN_MATCHES:
-        raise QACError(f"Only {0 if sources is None else len(sources)} sources detected; need at least {MIN_MATCHES}")
+        raise InsufficientSources(f"Only {0 if sources is None else len(sources)} sources detected; need at least {MIN_MATCHES}")
     peak = np.asarray(sources['peak'], dtype=float)
     flux = np.asarray(sources['flux'], dtype=float)
     # Photutils 3 renamed these columns; 2.x uses xcentroid/ycentroid.
@@ -650,28 +1057,42 @@ def detect_sources(image: np.ndarray) -> np.ndarray:
     good &= (xy[:,1] > 6) & (xy[:,1] < image.shape[0]-7)
     finite = image[valid]
     good &= peak < np.percentile(finite, 99.99) * 1.1 if len(finite) > 10000 else True
-    return xy[good][np.argsort(flux[good])[::-1]][:200]
+    # Count only usable centroids before deciding whether another FWHM guess may help.
+    selected = xy[good][np.argsort(flux[good])[::-1]][:200]
+    if len(selected) < MIN_MATCHES:
+        raise InsufficientSources(f'Only {len(selected)} usable sources detected; '
+                                  f'need at least {MIN_MATCHES}')
+    return selected
 
 
-def catalog_pixels(catalog: ReferenceCatalog, wcs: WCS, shape: tuple[int,int]) -> tuple[np.ndarray, SkyCoord]:
+# Extend every image edge by the same fraction of the longer image side, in pixels.
+def catalog_window_bounds(shape: tuple[int, int]) -> tuple[float, float, float, float]:
+    margin = max(shape)*CATALOG_WINDOW_MARGIN
+    return -margin, shape[1]+margin, -margin, shape[0]+margin
+
+
+# Retain finite projected references inside the shared window and rank them by catalogue magnitude.
+def catalog_pixels(catalog: ReferenceCatalog, wcs: WCS, shape: tuple[int,int], *,
+                   clip: bool = True) -> tuple[np.ndarray, SkyCoord]:
     x, y = wcs.world_to_pixel(catalog.sky)
     xy = np.column_stack((x, y))
-    margin = max(shape) * 0.3
-    good = np.isfinite(xy).all(axis=1) & (x > -margin) & (x < shape[1]+margin)
-    good &= (y > -margin) & (y < shape[0]+margin)
+    good = np.isfinite(xy).all(axis=1)
+    if clip:
+        left, right, bottom, top = catalog_window_bounds(shape)
+        good &= (x > left) & (x < right) & (y > bottom) & (y < top)
     xy, sky, mag = xy[good], catalog.sky[good], catalog.mag[good]
     order = np.argsort(np.where(np.isfinite(mag), mag, np.inf))
     return xy[order], sky[order]
 
 
-def magnitude_seed_groups(count: int) -> list[tuple[int, int]]:
+def magnitude_seed_groups(count: int, reference_limit: int = 180) -> list[tuple[int, int]]:
     """Try bright stars first, then wider and successively fainter groups."""
     groups = []
-    for end in (min(80, count), min(180, count)):
+    for end in (min(80, reference_limit, count), min(reference_limit, count)):
         if end and (0, end) not in groups:
             groups.append((0, end))
-    for start in range(80, count, 180):
-        end = min(start + 180, count)
+    for start in range(min(80, reference_limit), count, reference_limit):
+        end = min(start + reference_limit, count)
         if end - start >= MIN_MATCHES and (start, end) not in groups:
             groups.append((start, end))
     return groups
@@ -697,11 +1118,34 @@ def edges(xy: np.ndarray, count: int, neighbors: int = 5) -> list[tuple[int,int]
     result = []
     for i in range(len(xy)):
         for d, j in zip(np.atleast_1d(distances[i])[1:], np.atleast_1d(indices[i])[1:]):
-            if d > 12:
+            if d > MIN_SEED_SEPARATION:
                 result.append((i, int(j)))
     return result
 
 
+# Fit the existing orientation-preserving similarity model and apply it to arbitrary image positions.
+def similarity_transform(left: np.ndarray, right: np.ndarray,
+                         points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    a = np.column_stack((left[:,0], -left[:,1], np.ones(len(left)), np.zeros(len(left))))
+    b = np.column_stack((left[:,1], left[:,0], np.zeros(len(left)), np.ones(len(left))))
+    matrix = np.vstack((a,b))
+    target = np.concatenate((right[:,0],right[:,1]))
+    p = np.linalg.lstsq(matrix, target, rcond=None)[0]
+    transformed = np.column_stack((p[0]*points[:,0]-p[1]*points[:,1]+p[2],
+                                    p[1]*points[:,0]+p[0]*points[:,1]+p[3]))
+    return transformed, p
+
+
+# Refine either seed method using the same unique correspondences, similarity fit, and full-list rematch.
+def refine_coarse_match(sources: np.ndarray, refs: np.ndarray, seed_refs: np.ndarray,
+                        transformed: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    si, ri, _ = unique_matches(transformed, seed_refs, 5.0)
+    transformed, _ = similarity_transform(sources[si], seed_refs[ri], sources)
+    si, ri, _ = unique_matches(transformed, refs, 5.0)
+    return si, ri
+
+
+# Generate translation and star-pair hypotheses, preserving the established default matching order.
 def coarse_match(sources: np.ndarray, refs: np.ndarray,
                  scale_range: tuple[float,float] = (0.75, 1.25),
                  seed_indices: np.ndarray | None = None,
@@ -746,28 +1190,336 @@ def coarse_match(sources: np.ndarray, refs: np.ndarray,
                     factor.imag*(src[:,0]-src[a,0]) + factor.real*(src[:,1]-src[a,1]) + ref[p,1]))
                 consider(transformed)
     if best_count < MIN_MATCHES or best_transformed is None:
-        raise QACError("Could not find a reliable catalogue pattern; check -c, -s and the input image")
-    si, ri, _ = unique_matches(best_transformed, ref, 5.0)
-    # Estimate a similarity transform using the initial correspondences, then
-    # rematch all sources and all projected catalogue entries.
-    left = src[si]; right = ref[ri]
-    a = np.column_stack((left[:,0], -left[:,1], np.ones(len(left)), np.zeros(len(left))))
-    b = np.column_stack((left[:,1], left[:,0], np.zeros(len(left)), np.ones(len(left))))
-    matrix = np.vstack((a,b))
-    target = np.concatenate((right[:,0],right[:,1]))
-    p = np.linalg.lstsq(matrix, target, rcond=None)[0]
-    transformed = np.column_stack((p[0]*sources[:,0]-p[1]*sources[:,1]+p[2],
-                                    p[1]*sources[:,0]+p[0]*sources[:,1]+p[3]))
-    si, ri, _ = unique_matches(transformed, refs, 5.0)
-    return si, ri
+        raise QACError("Could not find a reliable catalogue pattern; check -c, -ps and the input image")
+    return refine_coarse_match(sources, refs, ref, best_transformed)
 
 
+# Index local and bright-star triangles by their two shortest side lengths divided by the longest.
+def triangle_features(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    count = len(points)
+    if count < 3:
+        return np.empty((0, 2)), np.empty((0, 3), dtype=int)
+    triangles = set(combinations(range(min(count, TRIANGLE_BRIGHT_LIMIT)), 3))
+    neighbors = cKDTree(points).query(points, k=min(count, TRIANGLE_NEIGHBORS+1))[1]
+    # Local triangles limit growth; the small global bright subset also tolerates differing neighbour lists.
+    for anchor, nearby in enumerate(neighbors):
+        others = [int(index) for index in nearby if index != anchor]
+        for first, second in combinations(others, 2):
+            triangles.add(tuple(sorted((anchor, first, second))))
+    vertices = np.asarray(sorted(triangles), dtype=int).reshape(-1, 3)
+    xy = points[vertices]
+    opposite = np.linalg.norm(xy[:, [1, 2, 0]]-xy[:, [2, 0, 1]], axis=2)
+    sides = np.sort(opposite, axis=1)
+    first, second = xy[:, 1]-xy[:, 0], xy[:, 2]-xy[:, 0]
+    area = np.abs(first[:, 0]*second[:, 1]-first[:, 1]*second[:, 0])
+    # Reject unresolved sides and nearly collinear shapes before normalizing or fitting a transform.
+    good = ((sides[:, 0] > MIN_SEED_SEPARATION) &
+            (area > TRIANGLE_MIN_AREA_RATIO*sides[:, 2]**2))
+    opposite, sides, vertices = opposite[good], sides[good], vertices[good]
+    order = np.argsort(opposite, axis=1, kind='stable')
+    vertices = np.take_along_axis(vertices, order, axis=1)
+    return sides[:, :2]/sides[:, 2, None], vertices
+
+
+# Use triangle shape candidates to seed the same global unique-match verification as pair matching.
+def triangle_match(sources: np.ndarray, refs: np.ndarray,
+                   scale_range: tuple[float,float] = (0.75, 1.25),
+                   seed_indices: np.ndarray | None = None,
+                   source_limit: int = 80) -> tuple[np.ndarray, np.ndarray]:
+    seed_refs = refs if seed_indices is None else refs[seed_indices]
+    if len(seed_refs) < MIN_MATCHES or len(sources) < MIN_MATCHES:
+        raise QACError('Fewer than eight detected or reference sources in the field')
+    src, ref = sources[:source_limit], seed_refs[:180]
+    if not np.isfinite(src).all() or not np.isfinite(ref).all():
+        raise QACError('Triangle matching requires finite source and reference coordinates')
+    source_features, source_triangles = triangle_features(src)
+    reference_features, reference_triangles = triangle_features(ref)
+    if not len(source_features) or not len(reference_features):
+        raise QACError('No usable non-collinear stellar triangles')
+    # Keep a deterministic, bounded list of similar shapes; no pair-matcher fallback obscures the choice.
+    distances, indices = cKDTree(reference_features).query(
+        source_features, k=3, distance_upper_bound=TRIANGLE_RATIO_TOLERANCE)
+    source_rows, ranks = np.nonzero(np.isfinite(distances))
+    order = np.argsort(distances[source_rows, ranks], kind='stable')[:TRIANGLE_MAX_CANDIDATES]
+    tree = cKDTree(ref)
+    best_count, best_error, best_transformed = 0, np.inf, None
+    for candidate in order:
+        left = src[source_triangles[source_rows[candidate]]]
+        right = ref[reference_triangles[indices[source_rows[candidate], ranks[candidate]]]]
+        # Vertex permutations handle equal-sided shapes; reflection remains controlled by the existing flip modes.
+        for permutation in TRIANGLE_PERMUTATIONS:
+            target = right[list(permutation)]
+            transformed_triangle, parameters = similarity_transform(left, target, left)
+            if not scale_range[0] < np.hypot(parameters[0], parameters[1]) < scale_range[1]:
+                continue
+            if np.max(np.linalg.norm(transformed_triangle-target, axis=1)) > 5.:
+                continue
+            p = parameters
+            transformed = np.column_stack((p[0]*src[:,0]-p[1]*src[:,1]+p[2],
+                                            p[1]*src[:,0]+p[0]*src[:,1]+p[3]))
+            distances_to_refs, nearest = tree.query(transformed, distance_upper_bound=5.)
+            matched = np.isfinite(distances_to_refs)
+            count = len(set(nearest[matched]))
+            error = float(np.median(distances_to_refs[matched])) if count else np.inf
+            if count > best_count or (count == best_count and error < best_error):
+                best_count, best_error, best_transformed = count, error, transformed
+    if best_count < MIN_MATCHES or best_transformed is None:
+        raise QACError('Could not find a reliable catalogue triangle pattern; check -c, -ps and the input image')
+    return refine_coarse_match(sources, refs, ref, best_transformed)
+
+
+# Deposit unit-weight samples by bilinear cloud-in-cell interpolation, wrapping only explicitly periodic axes.
+def scamp_histogram(coordinates: np.ndarray, shape: tuple[int, int],
+                    periodic: tuple[bool, bool] = (False, False)) -> np.ndarray:
+    histogram = np.zeros(shape, dtype=float)
+    base = np.floor(coordinates).astype(int)
+    fraction = coordinates-base
+    # Distribute each sample across adjacent cells, dropping contributions outside linear boundaries.
+    for first in (0, 1):
+        for second in (0, 1):
+            index = base+np.array([first, second])
+            weight = ((fraction[:, 0] if first else 1-fraction[:, 0]) *
+                      (fraction[:, 1] if second else 1-fraction[:, 1]))
+            good = np.ones(len(index), dtype=bool)
+            for axis in (0, 1):
+                if periodic[axis]:
+                    index[:, axis] %= shape[axis]
+                else:
+                    good &= (index[:, axis] >= 0) & (index[:, axis] < shape[axis])
+            np.add.at(histogram, (index[good, 0], index[good, 1]), weight[good])
+    return histogram
+
+
+# Compute ref-minus-source correlation lags; zero-pad linear axes and apply a Gaussian Fourier bandpass.
+def fft_correlation(reference: np.ndarray, source: np.ndarray, *,
+                     periodic: tuple[bool, bool] = (False, False),
+                     config: ScampConfig | None = None) -> np.ndarray:
+    config = config or ScampConfig()
+    if reference.shape != source.shape or reference.ndim != 2:
+        raise QACError('SCAMP histogram shapes must be identical and two-dimensional')
+    # Preserve circular angle lags while padding every linear axis against wraparound.
+    shape = tuple(size if wraps else 2*size for size, wraps in zip(reference.shape, periodic))
+    cross = (np.fft.rfftn(reference, s=shape, axes=(0, 1)) *
+             np.conj(np.fft.rfftn(source, s=shape, axes=(0, 1))))
+    fy = np.fft.fftfreq(shape[0])[:, None]
+    fx = np.fft.rfftfreq(shape[1])[None, :]
+    frequency2 = fy*fy+fx*fx
+    # Suppress both broad density structure/DC and noisy sub-bin structure without inventing positional weights.
+    bandpass = (np.exp(-2*np.pi**2*config.low_sigma**2*frequency2) *
+                (1-np.exp(-2*np.pi**2*config.high_sigma**2*frequency2)))
+    return np.fft.fftshift(np.fft.irfftn(cross*bandpass, s=shape, axes=(0, 1)))
+
+
+# Locate independent positive peaks and refine each within its bin using iterative Gaussian-weighted centring.
+def correlation_peaks(correlation: np.ndarray, *, valid: np.ndarray | None = None,
+                       periodic: tuple[bool, bool] = (False, False),
+                       count: int = 8, radius: int = 4) -> list[dict]:
+    shape = np.asarray(correlation.shape)
+    allowed = np.isfinite(correlation) if valid is None else (valid & np.isfinite(correlation))
+    work = np.where(allowed, correlation, -np.inf).copy()
+    grid = np.indices(correlation.shape)
+    peaks = []
+    # Suppress each selected peak's neighbourhood before searching for another independent proposal.
+    for _ in range(count):
+        peak = np.asarray(np.unravel_index(np.argmax(work), work.shape))
+        height = float(work[tuple(peak)])
+        if not np.isfinite(height) or height <= 0:
+            break
+        # Extract a local patch with angular wrapping and clipped linear boundaries.
+        offset = np.arange(-radius, radius+1)
+        dy, dx = np.meshgrid(offset, offset, indexing='ij')
+        yy, xx = peak[0]+dy, peak[1]+dx
+        inside = np.ones(yy.shape, dtype=bool)
+        for axis, values in enumerate((yy, xx)):
+            if not periodic[axis]:
+                inside &= (values >= 0) & (values < shape[axis])
+        patch = np.where(inside, correlation[yy % shape[0], xx % shape[1]], 0.)
+        patch = np.maximum(patch, 0.)
+        delta = np.zeros(2)
+        # This numerical centroid refines a correlation peak; it is not a Gaussian error model for the stars.
+        for _ in range(8):
+            weights = patch*np.exp(-((dy-delta[0])**2+(dx-delta[1])**2)/2.)
+            total = np.sum(weights)
+            if total <= 0:
+                break
+            delta = np.clip([np.sum(weights*dy)/total, np.sum(weights*dx)/total], -.75, .75)
+        # Measure contrast against the full surface, including peaks outside the allowed scale interval.
+        separation2 = np.zeros(correlation.shape)
+        for axis in (0, 1):
+            separation = np.abs(grid[axis]-peak[axis])
+            if periodic[axis]:
+                separation = np.minimum(separation, shape[axis]-separation)
+            separation2 += separation**2
+        independent = (separation2 > radius**2) & np.isfinite(correlation)
+        competing = max(0., float(np.max(correlation[independent]))) if independent.any() else 0.
+        contrast = height/competing if competing > 0 else float('inf')
+        lag = peak+delta-shape//2
+        peaks.append({'lag': tuple(float(value) for value in lag), 'height': height,
+                      'contrast': contrast})
+        work[separation2 <= radius**2] = -np.inf
+    return peaks
+
+
+# Form both pair histograms in the same log-distance/undirected-angle coordinates, retaining circular angle topology.
+def scamp_pair_histograms(sources: np.ndarray, refs: np.ndarray,
+                           config: ScampConfig) -> tuple[np.ndarray, np.ndarray, float, float]:
+    pairs = []
+    for points in (sources, refs):
+        first, second = np.triu_indices(len(points), 1)
+        vectors = points[second]-points[first]
+        distance = np.linalg.norm(vectors, axis=1)
+        good = np.isfinite(distance) & (distance > MIN_SEED_SEPARATION)
+        if not good.any():
+            raise QACError('SCAMP matching has no usable separated star pairs')
+        pairs.append((np.log(distance[good]), np.mod(np.arctan2(vectors[good, 1], vectors[good, 0]), np.pi)))
+    # Place both pair lists on the same padded logarithmic grid and periodic angle grid.
+    minimum = min(np.min(pair[0]) for pair in pairs)
+    maximum = max(np.max(pair[0]) for pair in pairs)
+    padding = max(.01, (maximum-minimum)/(config.log_bins-4)*2)
+    lower, upper = minimum-padding, maximum+padding
+    log_step = (upper-lower)/(config.log_bins-1)
+    angle_step = np.pi/config.angle_bins
+    histograms = [scamp_histogram(np.column_stack(((logs-lower)/log_step, angles/angle_step)),
+                                  (config.log_bins, config.angle_bins), (False, True))
+                  for logs, angles in pairs]
+    return histograms[0], histograms[1], log_step, angle_step
+
+
+# Find translation on separately centred clouds so a large absolute pointing error does not coarsen histogram cells.
+def scamp_translation(sources: np.ndarray, refs: np.ndarray, config: ScampConfig) -> list[dict]:
+    source_origin, reference_origin = np.median(sources, axis=0), np.median(refs, axis=0)
+    source, reference = sources-source_origin, refs-reference_origin
+    lower = np.minimum(source.min(axis=0), reference.min(axis=0))
+    upper = np.maximum(source.max(axis=0), reference.max(axis=0))
+    cell = max(float(np.max(upper-lower))/(config.position_bins-5), .25)
+    lower -= 2*cell
+    histograms = [scamp_histogram(((points-lower)/cell)[:, ::-1],
+                                   (config.position_bins, config.position_bins))
+                  for points in (source, reference)]
+    # Restore the independent cloud origins after recovering their relative histogram displacement.
+    correlation = fft_correlation(histograms[1], histograms[0], config=config)
+    peaks = correlation_peaks(correlation, count=config.position_peaks, radius=config.peak_radius)
+    for peak in peaks:
+        peak['shift'] = tuple(float(value) for value in
+                              (np.asarray(peak['lag'])[::-1]*cell+reference_origin-source_origin))
+        peak['cell_pixels'] = cell
+    return peaks
+
+
+# Use a linear local TAN guess for SCAMP matching, preserving pixel units, axes and resolved scale while excluding SIP.
+def scamp_tangent_wcs(initial: WCS, shape: tuple[int, int]) -> WCS:
+    center, _ = field_geometry(initial, shape)
+    tangent = WCS(naxis=2)
+    tangent.wcs.ctype = (['RA---TAN', 'DEC--TAN'] if initial.wcs.lng == 0 else
+                         ['DEC--TAN', 'RA---TAN'])
+    tangent.wcs.crpix = [(shape[1]+1)/2, (shape[0]+1)/2]
+    tangent.wcs.crval = ([center.ra.deg, center.dec.deg] if initial.wcs.lng == 0 else
+                         [center.dec.deg, center.ra.deg])
+    tangent.wcs.cd = initial.pixel_scale_matrix.copy()
+    tangent.wcs.radesys = initial.wcs.radesys
+    tangent.wcs.lonpole = initial.wcs.lonpole
+    tangent.wcs.latpole = initial.wcs.latpole
+    if np.isfinite(initial.wcs.equinox):
+        tangent.wcs.equinox = initial.wcs.equinox
+    return tangent
+
+
+# Reject ambiguous seed identities on both sides using full transformed source and reference lists.
+def scamp_unique_matches(transformed: np.ndarray, refs: np.ndarray
+                         ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    si, ri, distances = unique_matches(transformed, refs, 5.)
+    if not len(si):
+        return si, ri, distances
+    # Require mutual nearest neighbours with an empirical separation margin, not a statistical confidence.
+    reference_distances, _ = cKDTree(refs).query(transformed[si], k=2)
+    source_distances, source_indices = cKDTree(transformed).query(refs[ri], k=2)
+    keep = source_indices[:, 0] == si
+    for neighbours in (reference_distances, source_distances):
+        keep &= neighbours[:, 1] > np.maximum(2*neighbours[:, 0], neighbours[:, 0]+.5)
+    return si[keep], ri[keep], distances[keep]
+
+
+# Seed correspondences with scale/rotation FFTs followed by translation FFTs, then reuse QAC's global refinement.
+def scamp_match(sources: np.ndarray, refs: np.ndarray,
+                 scale_range: tuple[float, float] = (.75, 1.25),
+                 seed_indices: np.ndarray | None = None, source_limit: int = 80, *,
+                 config: ScampConfig | None = None, diagnostics: dict | None = None
+                 ) -> tuple[np.ndarray, np.ndarray]:
+    config = config or ScampConfig()
+    selected = refs if seed_indices is None else refs[seed_indices]
+    limit = config.max_sources if config.max_sources is not None else source_limit
+    if not isinstance(limit, (int, np.integer)) or not MIN_MATCHES <= limit <= 2000:
+        raise QACError('SCAMP effective source limit must be an integer between 8 and 2000')
+    src = sources[:limit]
+    ref = selected[:config.max_references]
+    if len(src) < MIN_MATCHES or len(ref) < MIN_MATCHES:
+        raise QACError('SCAMP matching needs at least eight detected and reference sources')
+    if not np.isfinite(src).all() or not np.isfinite(ref).all():
+        raise QACError('SCAMP matching requires finite projected coordinates')
+    # Correlate pair geometry and restrict scale proposals to the existing QAC tolerance.
+    source_hist, reference_hist, log_step, angle_step = scamp_pair_histograms(src, ref, config)
+    correlation = fft_correlation(reference_hist, source_hist, periodic=(False, True), config=config)
+    lags = np.arange(correlation.shape[0])-correlation.shape[0]//2
+    valid = np.broadcast_to(((lags*log_step > np.log(scale_range[0])) &
+                             (lags*log_step < np.log(scale_range[1])))[:, None], correlation.shape)
+    peaks = correlation_peaks(correlation, valid=valid, periodic=(False, True),
+                              count=config.pair_peaks, radius=config.peak_radius)
+    # Report peak contrast independently of the subsequent positional acceptance checks.
+    info = diagnostics if diagnostics is not None else {}
+    info.update(source_count=len(src), reference_count=len(ref),
+                pair_contrast=peaks[0]['contrast'] if peaks else 0., pair_peak_count=len(peaks),
+                log_step=log_step, angle_step_radians=angle_step)
+    print(f"  SCAMP pair-histogram contrast {info['pair_contrast']:.2f}; {len(src)}/{len(ref)} seed sources/references", flush=True)
+    best_count, best_error, best_pairs = 0, np.inf, None
+    # Rank verified proposals by unambiguous correspondence count and then median positional residual.
+    for peak_index, peak in enumerate(peaks):
+        scale = float(np.exp(peak['lag'][0]*log_step))
+        if not scale_range[0] < scale < scale_range[1]:
+            continue
+        # Undirected pair angles identify rotation modulo pi; positional matching distinguishes both branches.
+        for branch in (0., np.pi):
+            angle = peak['lag'][1]*angle_step+branch
+            factor = scale*np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+            rotated = src@factor.T
+            for position in scamp_translation(rotated, ref, config):
+                transformed = rotated+np.asarray(position['shift'])
+                si, ri, distances = unique_matches(transformed, ref, 5.)
+                if len(si) < MIN_MATCHES:
+                    continue
+                # Refine the coarse proposal before testing identities against the complete catalogues.
+                si, ri = refine_coarse_match(sources, refs, ref, transformed)
+                transformed, _ = similarity_transform(sources[si], refs[ri], sources)
+                si, ri, distances = scamp_unique_matches(transformed, refs)
+                count = len(si)
+                error = float(np.median(distances)) if count else np.inf
+                if count > best_count or (count == best_count and error < best_error):
+                    best_count, best_error, best_pairs = count, error, (si, ri)
+                    info.update(scale=scale, rotation_deg=float(np.rad2deg(angle)),
+                                shift=list(position['shift']), position_contrast=position['contrast'],
+                                selected_pair_peak=peak_index, selected_pair_contrast=peak['contrast'])
+    # Return seed identities only; the shared TAN/SIP pipeline must still validate the resulting solution.
+    if best_count < MIN_MATCHES or best_pairs is None:
+        raise QACError('SCAMP histogram proposals did not yield eight unique positional matches with unambiguous identities')
+    result = best_pairs
+    print(f"  SCAMP seed: scale {info['scale']:.6f}, rotation {info['rotation_deg']:.3f} deg; "
+          f"position contrast {info['position_contrast']:.2f}; {len(result[0])} unique matches", flush=True)
+    return result
+
+
+# Refine any seed method with the established TAN fit, clipping, and scale/spread acceptance checks.
 def fit_solution(sources: np.ndarray, refs: np.ndarray, sky: SkyCoord,
                  shape: tuple[int,int], initial: WCS,
                  scale_range: tuple[float,float] = (0.75, 1.25),
                  seed_indices: np.ndarray | None = None,
-                 source_limit: int = 80) -> tuple[WCS, int, float, np.ndarray, np.ndarray]:
-    si, ri = coarse_match(sources, refs, scale_range, seed_indices, source_limit)
+                 source_limit: int = 80, *,
+                 match_method: str = 'pair', scamp_config: ScampConfig | None = None,
+                 seed_diagnostics: dict | None = None) -> tuple[WCS, int, float, np.ndarray, np.ndarray]:
+    # Switch only initial correspondences; fitting, clipping, scale checks and validation stay shared.
+    if match_method not in MATCH_METHODS:
+        raise QACError(f'Unknown initial matching method: {match_method}')
+    matcher = {'pair': coarse_match, 'triangle': triangle_match, 'scamp': scamp_match}[match_method]
+    options = {'config': scamp_config, 'diagnostics': seed_diagnostics} if match_method == 'scamp' else {}
+    si, ri = matcher(sources, refs, scale_range, seed_indices, source_limit, **options)
     if len(si) < MIN_MATCHES:
         raise QACError("Too few unique catalogue matches")
     for iteration in range(4):
@@ -831,10 +1583,12 @@ def validate_linear_solution(sources: np.ndarray, sky: SkyCoord,
     return held_out_rms
 
 
+# Validate SIP with withheld stars, then fit all accepted detector correspondences.
 def fit_sip_distortion(sources: np.ndarray, sky: SkyCoord,
                        source_indices: np.ndarray, reference_indices: np.ndarray,
                        shape: tuple[int,int], degree: int,
-                       linear_wcs: WCS) -> tuple[WCS, int, float]:
+                       linear_wcs: WCS, *,
+                       diagnostics: MatchDiagnostics | None = None) -> tuple[WCS, int, float]:
     """Fit and validate SIP in original detector pixels after TAN matching."""
     minimum = {2: 25, 3: 40}[degree]
     if len(source_indices) < minimum:
@@ -889,6 +1643,9 @@ def fit_sip_distortion(sources: np.ndarray, sky: SkyCoord,
         raise
     except (ValueError, TypeError, RuntimeError) as exc:
         raise QACError(f"SIP degree {degree} fit failed: {exc}; rerun without -d") from exc
+    # Expose the validation already performed, without a second fit for the plot.
+    if diagnostics is not None:
+        diagnostics.validation_rms = sip_validation
     return fitted, len(xy), rms
 
 
@@ -1023,24 +1780,55 @@ def resample_image(image: np.ndarray, solution: WCS) -> tuple[np.ndarray, WCS]:
     return result, target
 
 
+# Record frame status explicitly, including when an input WCS was retained without calibration.
+def write_frame_status(header: fits.Header, error: str | None, *, resampled: bool) -> None:
+    header['QACVER'] = (VERSION, 'QAC software version')
+    header['QACSTAT'] = ('FAILED' if error is not None else 'SOLVED', 'QAC calibration status')
+    header['QACRSMP'] = (resampled, 'Pixels resampled by this QAC run')
+    header.pop('QACERR', None)
+    if error is not None:
+        # FITS strings are ASCII; retain the complete readable reason using replacement characters.
+        reason = ' '.join(error.split()).encode('ascii', errors='replace').decode('ascii')
+        header['QACERR'] = reason
+        header.add_history(f'QAC {VERSION}: FAILED; input pixels and unverified WCS retained')
+
+
+# Write successful calibrations and retain explicitly failed frames in their native pixels.
 def output_hdus(hdul: fits.HDUList, selected: list[Frame], solutions: dict[Frame,WCS],
-                *, resample: bool = False, extract_selected: bool = False) -> fits.HDUList:
+                *, resample: bool = False, extract_selected: bool = False,
+                failures: dict[Frame, str] | None = None,
+                prepared: dict[Frame, tuple[np.ndarray, WCS]] | None = None) -> fits.HDUList:
+    failures = {} if failures is None else failures
     # A specifically selected frame is a standalone 2-D FITS image, even if
     # it came from an image extension. An all-frame 3-D stack is split into
     # separate 2-D extensions with independent WCS headers.
-    def pixels_and_wcs(frame: Frame) -> tuple[np.ndarray, WCS]:
-        data = hdul[frame.hdu].data
-        plane = data if frame.plane is None else data[frame.plane]
+    # Use prepared resampling results; failed frames preserve their original dtype and pixels.
+    def pixels_and_wcs(frame: Frame) -> tuple[np.ndarray, WCS | None]:
+        plane = image_of(hdul, frame, dtype=None)
+        if frame not in solutions:
+            if frame not in failures:
+                raise QACError(f'Missing solution or failure status for {frame.label}')
+            return plane, None
         if resample:
+            if prepared is not None:
+                return prepared[frame]
             print(f"  Resampling {frame.label} onto a TAN grid ...", flush=True)
             return resample_image(np.asarray(plane), solutions[frame])
         return plane, solutions[frame]
 
+    # Resampling invalidates integer scaling and detector coordinate keywords only on success.
     def resampled_header(header: fits.Header) -> None:
         if resample:
             for key in ('BLANK', 'BSCALE', 'BZERO', 'DATAMIN', 'DATAMAX'):
                 header.pop(key, None)
             remove_physical_coordinates(header)
+
+    # Write a new WCS only for successful frames, then replace stale calibration-status cards.
+    def frame_header(header: fits.Header, frame: Frame, wcs: WCS | None) -> None:
+        if wcs is not None:
+            resampled_header(header)
+            write_wcs(header, wcs, resampled=resample)
+        write_frame_status(header, failures.get(frame), resampled=resample and wcs is not None)
 
     if len(selected) == 1 and (extract_selected or selected[0].plane is not None):
         f = selected[0]
@@ -1051,8 +1839,7 @@ def output_hdus(hdul: fits.HDUList, selected: list[Frame], solutions: dict[Frame
         if f.plane is not None:
             remove_physical_coordinates(header)
         data, wcs = pixels_and_wcs(f)
-        resampled_header(header)
-        write_wcs(header, wcs, resampled=resample)
+        frame_header(header, f, wcs)
         if f.plane is not None:
             header.add_history(f"Extracted plane {f.plane+1} from HDU {f.hdu}")
         else:
@@ -1071,42 +1858,685 @@ def output_hdus(hdul: fits.HDUList, selected: list[Frame], solutions: dict[Frame
                 header['EXTNAME'] = f'{hdu.name if hdu_num else "FRAME"}_{f.plane+1}'
                 header['QACPLANE'] = (f.plane+1, 'Original 1-based plane number')
                 data, wcs = pixels_and_wcs(f)
-                resampled_header(header)
-                write_wcs(header, wcs, resampled=resample)
+                frame_header(header, f, wcs)
                 out.append(fits.ImageHDU(data=data, header=header))
         else:
             copied = hdu.copy()
             if fset:
                 data, wcs = pixels_and_wcs(fset[0])
-                if resample:
-                    resampled_header(copied.header)
+                frame_header(copied.header, fset[0], wcs)
+                if resample and wcs is not None:
                     copied.data = data
-                write_wcs(copied.header, wcs, resampled=resample)
             out.append(copied)
     return fits.HDUList(out)
 
 
+# Strip known FITS suffixes consistently for both calibrated images and PNGs.
+def fits_basename(path: Path) -> str:
+    for suffix in ('.fits.gz', '.fit.gz', '.fits', '.fit', '.fts'):
+        if path.name.lower().endswith(suffix):
+            return path.name[:-len(suffix)]
+    return path.name
+
+
+# Preserve the established FITS naming scheme for selected and resampled frames.
 def output_path(path: Path, *, resampled: bool = False, frame_number: int | None = None) -> Path:
-    name = path.name
     frame_suffix = f'_q{frame_number}' if frame_number is not None else ''
     ending = frame_suffix + ('_resampled.fits' if resampled else '_astro.fits')
-    for suffix in ('.fits.gz', '.fit.gz', '.fits', '.fit', '.fts'):
-        if name.lower().endswith(suffix):
-            return path.with_name(name[:-len(suffix)] + ending)
-    return path.with_name(name + ending)
+    return path.with_name(fits_basename(path) + ending)
 
 
+# Name a combined diagnostic beside the FITS file, adding page numbers only when needed.
+def diagnostic_path(path: Path, page_number: int | None = None) -> Path:
+    suffix = f'_page{page_number}' if page_number is not None else ''
+    return path.with_name(fits_basename(path) + suffix + '.png')
+
+
+# Plan every diagnostic output before querying, with readable groups for long cubes.
+def diagnostic_pages(path: Path, selected: list[Frame]) -> dict[Path, list[Frame]]:
+    groups = [selected[start:start+PLOT_FRAMES_PER_PAGE]
+              for start in range(0, len(selected), PLOT_FRAMES_PER_PAGE)]
+    return {diagnostic_path(path, page+1 if len(groups) > 1 else None): group
+            for page, group in enumerate(groups)}
+
+
+# Measure observed-minus-reference offsets on the sky, including RA wrap and cos(Dec).
+def diagnostic_residuals(solution: WCS, sources: np.ndarray,
+                         matches: MatchDiagnostics) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if matches.source_indices is None or matches.reference_sky is None:
+        raise QACError('No accepted match information is available for the diagnostic plot')
+    # Use the original accepted pairs rather than performing another catalogue match.
+    xy = sources[matches.source_indices]
+    reference = matches.reference_sky
+    measured = solution.pixel_to_world(xy[:, 0], xy[:, 1]).transform_to(reference.frame)
+    east, north = reference.spherical_offsets_to(measured)
+    return east.arcsec, north.arcsec, reference.separation(measured).arcsec
+
+
+# Map the existing accepted detections and references to calibrated output pixels.
+def diagnostic_positions(display_wcs: WCS, solution: WCS,
+                         data: FrameDiagnostics) -> tuple[np.ndarray, np.ndarray]:
+    measured_sky = solution.pixel_to_world(data.sources[:, 0], data.sources[:, 1])
+    display_xy = np.column_stack(display_wcs.world_to_pixel(measured_sky))
+    reference_xy = np.column_stack(display_wcs.world_to_pixel(data.matches.reference_sky))
+    return display_xy, reference_xy
+
+
+# Follow the finding-chart auto cuts without depending on another project's installation.
+def diagnostic_normalization(image: np.ndarray):
+    from astropy.visualization import AsinhStretch, ImageNormalize
+
+    # Sample finite pixels before estimating percentile limits and the clipped sky.
+    finite = image[np.isfinite(image)]
+    if not finite.size:
+        raise QACError('Diagnostic image has no finite pixels')
+    stride = max(1, finite.size // PLOT_SCALING_SAMPLE)
+    sample = finite[::stride]
+    lower, upper = np.percentile(sample, [1, 99.5])
+    _, median, std = sigma_clipped_stats(sample, sigma=3.0, maxiters=5)
+    if np.isfinite(std) and std > 0:
+        vmin = max(median-2*std, lower)
+        vmax = min(median+20*std, upper)
+        if vmin >= vmax:
+            vmin, vmax = lower, upper
+    else:
+        vmin, vmax = lower, upper
+
+    # Protect black star cores, then move the sky toward 75% white in reversed gray.
+    stretch = AsinhStretch(a=PLOT_ASINH_A)
+    minimum_fraction, target_fraction = stretch.inverse(
+        np.array([1-PLOT_MIN_SKY_BRIGHTNESS, 1-PLOT_TARGET_SKY_BRIGHTNESS]))
+    if np.isfinite(median) and median > vmin and minimum_fraction > 0:
+        vmax = max(vmax, vmin+(median-vmin)/minimum_fraction)
+        vmin = max(vmin, (median-target_fraction*vmax)/(1-target_fraction))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin >= vmax:
+        raise QACError('Cannot determine finite, nondegenerate diagnostic display cuts')
+    return ImageNormalize(vmin=float(vmin), vmax=float(vmax), stretch=stretch, clip=True)
+
+
+# Reproject a diagnostic view onto a centred north-up/east-left TAN grid without changing FITS data.
+def north_up_diagnostic(image: np.ndarray, source: WCS) -> tuple[np.ndarray, WCS]:
+    height, width = image.shape
+    center = source.pixel_to_world((width-1)/2, (height-1)/2).icrs
+    scale = float(np.sqrt(abs(np.linalg.det(source.pixel_scale_matrix))))
+    target = WCS(naxis=2)
+    target.wcs.ctype = ['RA---TAN', 'DEC--TAN']
+    target.wcs.radesys = 'ICRS'
+    target.wcs.crval = [center.ra.deg, center.dec.deg]
+    target.wcs.crpix = [1, 1]
+    target.wcs.cd = np.diag([-scale, scale])
+
+    # Sample all four boundaries to retain the rotated footprint, including curved SIP edges.
+    edge_x = np.linspace(-.5, width-.5, 129)
+    edge_y = np.linspace(-.5, height-.5, 129)
+    x = np.r_[edge_x, edge_x, np.full(129, -.5), np.full(129, width-.5)]
+    y = np.r_[np.full(129, -.5), np.full(129, height-.5), edge_y, edge_y]
+    tx, ty = target.world_to_pixel(source.pixel_to_world(x, y))
+    out_width = 2*int(np.ceil(np.max(np.abs(tx))))+3
+    out_height = 2*int(np.ceil(np.max(np.abs(ty))))+3
+    target.wcs.crpix = [(out_width+1)/2, (out_height+1)/2]
+    target.pixel_shape = (out_width, out_height)
+
+    # Reuse SciPy's bilinear sampling with finite-pixel weights, solely for the diagnostic image.
+    finite = np.isfinite(image)
+    values = np.where(finite, image, 0.).astype(np.float32)
+    weights = finite.astype(np.float32)
+    result = np.full((out_height, out_width), np.nan, dtype=np.float32)
+    rows_per_chunk = max(1, 1_000_000//out_width)
+    for row in range(0, out_height, rows_per_chunk):
+        stop = min(out_height, row+rows_per_chunk)
+        x, y = np.meshgrid(np.arange(out_width, dtype=float), np.arange(row, stop, dtype=float))
+        try:
+            sx, sy = source.world_to_pixel(target.pixel_to_world(x, y))
+        except NoConvergence as exc:
+            # SIP extrapolation can diverge outside the footprint; leave those display pixels blank.
+            pixels = exc.best_solution.copy()
+            for indices in (exc.divergent, exc.slow_conv):
+                if indices is not None:
+                    pixels[indices] = np.nan
+            sx, sy = pixels[:, 0].reshape(x.shape), pixels[:, 1].reshape(y.shape)
+        inside = (np.isfinite(sx) & np.isfinite(sy) &
+                  (sx >= 0) & (sx <= width-1) & (sy >= 0) & (sy <= height-1))
+        coordinates = [np.where(inside, sy, 0), np.where(inside, sx, 0)]
+        sampled = map_coordinates(values, coordinates, order=1, mode='constant', cval=0.)
+        weight = map_coordinates(weights, coordinates, order=1, mode='constant', cval=0.)
+        np.divide(sampled, weight, out=result[row:stop], where=inside & (weight > 1e-6))
+    return result, target
+
+
+# Measure the field centre and shorter angular side from opposite image-edge midpoints.
+def field_geometry(wcs: WCS, shape: tuple[int, int]) -> tuple[SkyCoord, u.Quantity]:
+    height, width = shape
+    x, y = (width-1)/2, (height-1)/2
+    center = wcs.pixel_to_world(x, y)
+    horizontal = wcs.pixel_to_world([-.5, width-.5], [y, y])
+    vertical = wcs.pixel_to_world([x, x], [-.5, height-.5])
+    shorter_span = min(horizontal[0].separation(horizontal[1]),
+                       vertical[0].separation(vertical[1]))
+    return center, shorter_span.to(u.arcsec)
+
+
+# Reuse the same angular field definition for annotations and pointing-recovery displacements.
+def pointing_offset(wcs: WCS, shape: tuple[int, int], requested: SkyCoord
+                    ) -> tuple[SkyCoord, float, float]:
+    center, shorter_span = field_geometry(wcs, shape)
+    separation = float(requested.separation(center).arcsec)
+    return center, separation, separation/shorter_span.to_value(u.arcsec)
+
+
+# Mark requested-to-solved pointing on the displayed grid, clipping off-field arrows to the edge.
+def draw_pointing_offset(field, wcs: WCS, shape: tuple[int, int], requested: SkyCoord,
+                         *, compact: bool,
+                         measurement: tuple[WCS, tuple[int, int]] | None = None) -> None:
+    from matplotlib.font_manager import FontProperties
+    from matplotlib.lines import Line2D
+    from matplotlib.offsetbox import AnchoredOffsetbox, DrawingArea, TextArea, VPacker
+    from matplotlib.patheffects import withStroke
+    from matplotlib.textpath import TextPath
+
+    # Preserve the original output field's centre, side lengths, and boundary after display rotation.
+    measurement_wcs, measurement_shape = measurement if measurement is not None else (wcs, shape)
+    center, separation, fraction = pointing_offset(measurement_wcs, measurement_shape, requested)
+    display_wcs = wcs
+    wcs, shape = measurement_wcs, measurement_shape
+    height, width = shape
+    center_xy = np.array([(width-1)/2, (height-1)/2])
+    try:
+        requested_xy = np.array(wcs.world_to_pixel(requested), dtype=float)
+    except (NoConvergence, ValueError):
+        requested_xy = np.full(2, np.nan)
+    projectable = np.all(np.isfinite(requested_xy)) and separation < 90*3600
+    inside = projectable and (-.5 <= requested_xy[0] <= width-.5 and
+                              -.5 <= requested_xy[1] <= height-.5)
+    vector = requested_xy-center_xy
+    if not projectable:
+        # An unprojectable sky position still has a local on-sky bearing toward the panel edge.
+        nearby = center.directional_offset_by(center.position_angle(requested), 1*u.arcsec)
+        vector = np.array(wcs.world_to_pixel(nearby))-center_xy
+        vector *= 2*max(width, height)/np.linalg.norm(vector)
+
+    # Keep both endpoints inside the panel so annotations cannot expand or cross its boundaries.
+    factors = np.divide(np.array([width, height])/2, np.abs(vector),
+                        out=np.full(2, np.inf), where=np.abs(vector) > 0)
+    start = center_xy+vector*min(1., float(np.min(factors)))
+    start = np.array(display_wcs.world_to_pixel(wcs.pixel_to_world(*start)))
+    center_xy = np.array(display_wcs.world_to_pixel(center))
+    contrast = [withStroke(linewidth=3.5 if compact else 4.5, foreground='white')]
+    if np.linalg.norm(vector) > 1e-6:
+        arrow = field.annotate('', xy=center_xy, xytext=start,
+                               arrowprops={'arrowstyle': '->', 'color': POINTING_COLOR,
+                                           'lw': 1.8 if compact else 2.4}, zorder=6)
+        arrow.set_gid('qac-pointing-arrow')
+        arrow.arrow_patch.set_path_effects(contrast)
+    if inside:
+        field.plot(*display_wcs.world_to_pixel(requested), marker='D', color=POINTING_COLOR,
+                   ms=7 if compact else 10, markerfacecolor='none', mew=1.8,
+                   linestyle='none', zorder=7, path_effects=contrast)
+
+    # Underline the offset label only above the declared 5% threshold; keep the key self-contained.
+    lines = [f'Pointing offset: {separation:.1f}″', f'{100*fraction:.1f}% of shorter side']
+    fontsize = 8 if compact else 11
+    label = TextArea('\n'.join(lines), textprops={'fontsize': fontsize, 'multialignment': 'right'})
+    if fraction > POINTING_OFFSET_THRESHOLD:
+        font = FontProperties(size=fontsize)
+        length = max(TextPath((0, 0), line, prop=font).get_extents().width for line in lines)
+        underline = DrawingArea(length, 2)
+        line = Line2D([0, length], [1, 1], color=POINTING_COLOR, linewidth=2)
+        line.set_gid('qac-pointing-warning')
+        underline.add_artist(line)
+        label = VPacker(children=[label, underline], align='right', pad=0, sep=1)
+    box = AnchoredOffsetbox(loc='upper right', child=label, pad=.3, borderpad=.4,
+                             bbox_to_anchor=(.99, .99), bbox_transform=field.transAxes,
+                             frameon=True)
+    box.set_gid('qac-pointing-offset')
+    box.patch.set(facecolor='white', edgecolor='#777777', alpha=.92, linewidth=.6)
+    box.set_zorder(8)
+    field.add_artist(box)
+
+
+# Reuse identical field normalization, rings, orientation arrows, and scale bars in every layout.
+def draw_diagnostic_field(field, image: np.ndarray, display_wcs: WCS,
+                          display_xy: np.ndarray, matches: MatchDiagnostics, *,
+                          legend: bool = True, compact: bool = False,
+                          requested_center: SkyCoord | None = None,
+                          pointing_measurement: tuple[WCS, tuple[int, int]] | None = None) -> None:
+    from matplotlib.patheffects import withStroke
+
+    # Derive marker locations and angular annotation scale from the displayed frame.
+    height, width = image.shape
+    scale = float(np.sqrt(abs(np.linalg.det(display_wcs.pixel_scale_matrix))) * 3600)
+    matched_xy = display_xy[matches.source_indices]
+    # Match the finding-chart light sky, inverted stars, sampled cuts, and asinh stretch.
+    norm = diagnostic_normalization(image)
+    # ImageNormalize with clipping can remove masks; explicit alpha keeps empty sky footprints blank.
+    field.imshow(np.ma.masked_invalid(image), origin='lower', cmap='gray_r', norm=norm,
+                 interpolation='nearest', alpha=np.isfinite(image).astype(np.float32))
+    rings = field.scatter(matched_xy[:, 0], matched_xy[:, 1], s=38 if compact else 90, facecolors='none',
+                          edgecolors='cyan', linewidths=1.0 if compact else 1.3,
+                          label='Final fit matches', zorder=3)
+    rings.set_path_effects([withStroke(linewidth=2.0 if compact else 2.8, foreground='#333333')])
+    # Source extraction already returns descending image flux; no second detection is needed.
+    brightest = display_xy[:10]
+    bright_rings = field.scatter(brightest[:, 0], brightest[:, 1], s=110 if compact else 240, facecolors='none',
+                                edgecolors='gold', linewidths=1.7 if compact else 2.4,
+                                label=f'{len(brightest)} brightest detected sources', zorder=4)
+    bright_rings.set_path_effects([withStroke(linewidth=2.7 if compact else 3.7, foreground='#333333')])
+    field.set_xlim(-.5, width-.5)
+    field.set_ylim(-.5, height-.5)
+    field.coords[0].set_axislabel('Right ascension', size=10 if compact else 14)
+    field.coords[1].set_axislabel('Declination', size=10 if compact else 14)
+    field.coords[0].set_ticklabel(size=9 if compact else 12)
+    field.coords[1].set_ticklabel(size=9 if compact else 12)
+    if legend:
+        field.legend(loc='upper left', facecolor='white', edgecolor='#555555',
+                     labelcolor='black', fontsize=11, framealpha=.9)
+
+    # Derive compass directions from the actual WCS, so mirrored images remain correct.
+    center_pixel = np.array([(width-1)/2, (height-1)/2])
+    center_sky = display_wcs.pixel_to_world(*center_pixel)
+    contrast = [withStroke(linewidth=3, foreground='white')]
+    for label, angle in (('N', 0), ('E', 90)):
+        displaced = center_sky.directional_offset_by(angle*u.deg, 10*scale*u.arcsec)
+        endpoint = np.array(display_wcs.world_to_pixel(displaced))
+        direction = (endpoint-center_pixel) / np.array([width, height])
+        direction *= .075 / np.linalg.norm(direction)
+        start = np.array([.87, .13])
+        end = start + direction
+        arrow = field.annotate('', xy=end, xytext=start, xycoords='axes fraction',
+                               arrowprops={'arrowstyle': '->', 'color': 'black', 'lw': 1.8})
+        arrow.arrow_patch.set_path_effects(contrast)
+        field.text(*(end+direction*.22), label, transform=field.transAxes,
+                   color='black', ha='center', va='center', weight='bold', fontsize=10 if compact else 13,
+                   path_effects=contrast)
+
+    # Label a local angular scale using the measured separation of the bar endpoints.
+    bar_x = np.array([.07, .27])*width-.5
+    bar_y = .065*height-.5
+    bar_world = display_wcs.pixel_to_world(bar_x, np.full(2, bar_y))
+    length = bar_world[0].separation(bar_world[1]).arcsec
+    scale_label = f'{length/60:.2g} arcmin' if length >= 60 else f'{length:.2g} arcsec'
+    field.plot(bar_x, [bar_y, bar_y], color='black', lw=3, path_effects=contrast)
+    field.text(bar_x.mean(), bar_y+.02*height, scale_label, color='black',
+               ha='center', va='bottom', fontsize=9 if compact else 12, path_effects=contrast)
+
+    # Annotate explicit -c requests only on successfully calibrated fields.
+    if requested_center is not None:
+        draw_pointing_offset(field, display_wcs, image.shape, requested_center, compact=compact,
+                             measurement=pointing_measurement)
+
+
+# Render calibrated pixels and accepted correspondences in a compact, readable layout.
+def diagnostic_figure(image: np.ndarray, display_wcs: WCS, solution: WCS,
+                      data: FrameDiagnostics, *, title: str, instrument: str | None,
+                      north_up: bool = False):
+    # Import plotting dependencies only when requested; use Agg without changing pyplot.
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+    from matplotlib.patches import Circle
+
+    # Orient explicit -q views while preserving the original field geometry for pointing statistics.
+    pointing_measurement = (display_wcs, image.shape)
+    if north_up:
+        image, display_wcs = north_up_diagnostic(image, display_wcs)
+
+    # Transform detector detections onto the displayed grid, including resampled images.
+    sources, matches = data.sources, data.matches
+    east, north, radial = diagnostic_residuals(solution, sources, matches)
+    display_xy, reference_xy = diagnostic_positions(display_wcs, solution, data)
+    matched_xy = display_xy[matches.source_indices]
+    height, width = image.shape
+    scale = float(np.sqrt(abs(np.linalg.det(display_wcs.pixel_scale_matrix))) * 3600)
+    rms = float(np.sqrt(np.mean(radial**2)))
+
+    # Keep the field large and use the right column's full width for summary and graphs.
+    figure = Figure(figsize=(16, 9), facecolor='white')
+    FigureCanvasAgg(figure)
+    grid = figure.add_gridspec(1, 2, width_ratios=(1.05, 1), left=.055, right=.975,
+                              bottom=.105, top=.88, wspace=.16)
+    quality = grid[0, 1].subgridspec(2, 2, height_ratios=(.82, 1), wspace=.34, hspace=.27)
+    field = figure.add_subplot(grid[0, 0], projection=display_wcs)
+    summary = figure.add_subplot(quality[0, :])
+    scatter = figure.add_subplot(quality[1, 0])
+    vectors = figure.add_subplot(quality[1, 1])
+    figure.suptitle(f'QAC {VERSION} | Astrometric calibration', fontsize=20, y=.975)
+    figure.text(.5, .935, title, ha='center', fontsize=13)
+
+    # Reuse the same field renderer as the combined contact sheet.
+    draw_diagnostic_field(field, image, display_wcs, display_xy, matches,
+                          requested_center=data.requested_center,
+                          pointing_measurement=pointing_measurement)
+
+    # Report radial fit residuals separately from the existing held-out validation refit.
+    model = f'SIP degree {solution.sip.a_order}' if solution.sip is not None else 'TAN'
+    validation = (f'{matches.validation_rms:.3f} arcsec'
+                  if matches.validation_rms is not None else 'unavailable')
+    observed = data.obstime.utc.isot[:19] if data.obstime is not None else 'unavailable'
+    lines = [f'Reference: {data.catalog_label}',
+             f'Model: {model}    Instrument: {instrument or "unspecified"}',
+             f'Matches: {len(radial)} / {len(sources)} detections considered',
+             f'References near field: {data.reference_count}',
+             f'Fit RMS (radial):       {rms:.3f} arcsec',
+             f'Held-out refit RMS:     {validation}',
+             f'Median / P90 residual:  {np.median(radial):.3f} / {np.percentile(radial, 90):.3f} arcsec',
+             f'Mean East / North:     {np.mean(east):+.3f} / {np.mean(north):+.3f} arcsec',
+             f'Pixel scale at CRPIX:   {scale:.4f} arcsec/pixel',
+             f'Observation (UTC): {observed}']
+    summary.set_axis_off()
+    summary.text(0, 1, '\n'.join(lines), transform=summary.transAxes,
+                 va='top', fontsize=13, linespacing=1.5)
+
+    # Equal residual axes expose offsets, directional scatter, and individual outliers.
+    scatter.scatter(east, north, s=25, color='#008c9c', alpha=.8, linewidths=0)
+    scatter.add_patch(Circle((0, 0), rms, fill=False, color='#777777',
+                             ls='--', lw=1, label='Fit RMS radius'))
+    limit = max(.05, 1.15*float(np.max(np.abs(np.r_[east, north]))))
+    scatter.set(xlim=(-limit, limit), ylim=(-limit, limit),
+                xlabel='East residual (arcsec)', ylabel='North residual (arcsec)',
+                title='Observed minus reference')
+    scatter.set_aspect('equal', adjustable='box')
+    scatter.axhline(0, color='#888888', lw=.7)
+    scatter.axvline(0, color='#888888', lw=.7)
+    scatter.grid(alpha=.18)
+    scatter.legend(loc='upper right', fontsize=10)
+
+    # Draw residual directions in output-pixel orientation, with angular lengths enlarged.
+    delta = matched_xy-reference_xy
+    distances = np.linalg.norm(delta, axis=1)
+    direction = np.divide(delta, distances[:, None], out=np.zeros_like(delta),
+                          where=distances[:, None] > 0)
+    vector_values = direction*radial[:, None]
+    reference_length = max(.01, float(f'{np.percentile(radial, 90):.1g}'))
+    quiver = vectors.quiver(matched_xy[:, 0], matched_xy[:, 1],
+                            vector_values[:, 0], vector_values[:, 1],
+                            angles='xy', scale_units='xy',
+                            scale=reference_length/(.12*min(width, height)),
+                            color='#008c9c', width=.004, pivot='tail')
+    vectors.scatter(matched_xy[:, 0], matched_xy[:, 1], s=4, color='#555555')
+    key = vectors.quiverkey(quiver, .08, .94, reference_length,
+                            f'{reference_length:g} arcsec', labelpos='E',
+                            fontproperties={'size': 10})
+    key.text.set_bbox({'facecolor': 'white', 'edgecolor': 'none', 'alpha': .9, 'pad': 2})
+    vectors.set(xlim=(-.5, width-.5), ylim=(-.5, height-.5), xlabel='Output X (pixel)',
+                ylabel='Output Y (pixel)', title='Residual vectors (enlarged)')
+    vectors.set_aspect('equal', adjustable='box')
+    vectors.grid(alpha=.18)
+
+    # Use consistent readable type across both quality graphs instead of Matplotlib defaults.
+    for axis in (scatter, vectors):
+        axis.tick_params(labelsize=11)
+        axis.xaxis.label.set_size(12)
+        axis.yaxis.label.set_size(12)
+        axis.title.set_size(13)
+
+    # Explain the statistical scope and the reuse of validation stars in the final fit.
+    figure.text(.5, .025, 'Fit residuals measure reference-catalogue agreement; '
+                'the final fit includes the validation stars.', ha='center', fontsize=12)
+    return figure
+
+
+# Show an uncalibrated frame on pixel axes with a bounded, readable failure explanation.
+def draw_failed_field(axis, image: np.ndarray, reason: str, *, compact: bool = True) -> None:
+    from matplotlib.colors import Normalize
+
+    # Detection failures can leave constant or entirely invalid images; still show their footprint.
+    try:
+        norm = diagnostic_normalization(image)
+    except QACError:
+        finite = image[np.isfinite(image)]
+        low, high = (float(np.min(finite)), float(np.max(finite))) if finite.size else (0., 1.)
+        if low >= high:
+            width = max(1., abs(low)*.01)
+            low, high = low-width, high+width
+        norm = Normalize(vmin=low, vmax=high, clip=True)
+    axis.imshow(np.ma.masked_invalid(image), origin='lower', cmap='gray_r', norm=norm,
+                interpolation='nearest')
+    axis.set(xlim=(-.5, image.shape[1]-.5), ylim=(-.5, image.shape[0]-.5),
+             xlabel='Input X (pixel)', ylabel='Input Y (pixel)')
+    axis.tick_params(labelsize=9 if compact else 12)
+    for spine in axis.spines.values():
+        spine.set_edgecolor('#c62828')
+        spine.set_linewidth(3)
+
+    # Use image-relative placement so the status remains visible for every detector size.
+    axis.text(.025, .975, 'FAILED', transform=axis.transAxes, ha='left', va='top',
+              color='white', fontsize=13 if compact else 18, weight='bold',
+              bbox={'facecolor': '#c62828', 'edgecolor': '#c62828', 'pad': 4})
+    short = textwrap.shorten(' '.join(reason.split()), width=230, placeholder='…')
+    axis.text(.025, .85, textwrap.fill(short, width=40 if compact else 65),
+              transform=axis.transAxes, ha='left', va='top', color='#a51d1d',
+              fontsize=10 if compact else 12, linespacing=1.25,
+              bbox={'facecolor': 'white', 'edgecolor': 'none', 'alpha': .92, 'pad': 3})
+
+
+# Fill the page with selected images and independent per-frame success/failure diagnostics.
+def combined_diagnostic_figure(frames: list[DiagnosticFrame], *, title: str,
+                               instrument: str | None):
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+    from matplotlib.patches import Patch
+
+    # Enlarge MERGED beside its four quadrants instead of spending a whole tile on a key.
+    count = len(frames)
+    if not 1 <= count <= PLOT_FRAMES_PER_PAGE:
+        raise QACError(f'Diagnostic pages need 1 to {PLOT_FRAMES_PER_PAGE} frames')
+    merged_layout = count == 5 and frames[-1].frame.name.upper() == 'MERGED'
+    if merged_layout:
+        size, ratio = (22, 9), 2.05
+    elif count == 5:
+        size, ratio = (18, 10), 1.30
+    elif count >= 4:
+        size, ratio = ((20, 9), 1.5) if count == 6 else ((16, 9), 1.15)
+    elif count == 3:
+        size, ratio = (20, 6.5), 2.0
+    else:
+        size, ratio = ((16, 6.5), 1.5) if count == 2 else ((14, 7.5), 1.1)
+    figure = Figure(figsize=size, facecolor='white')
+    FigureCanvasAgg(figure)
+    grid = figure.add_gridspec(1, 2, width_ratios=(ratio, 1), left=.045, right=.98,
+                              bottom=.095, top=.865, wspace=.12)
+    if merged_layout:
+        fields = grid[0, 0].subgridspec(2, 4, wspace=.28, hspace=.27)
+        slots = [fields[0, 0], fields[0, 1], fields[1, 0], fields[1, 1], fields[:, 2:]]
+    elif count == 5:
+        # Different row heights let a three-image row and a two-image row both fill their width.
+        fields = grid[0, 0].subgridspec(2, 6, height_ratios=(2, 3), wspace=.28, hspace=.25)
+        slots = [fields[0, 0:2], fields[0, 2:4], fields[0, 4:6], fields[1, 0:3], fields[1, 3:6]]
+    else:
+        columns = 3 if count in (3, 6) else min(2, count)
+        rows = (count+columns-1)//columns
+        fields = grid[0, 0].subgridspec(rows, columns, wspace=.25, hspace=.27)
+        slots = [fields[index//columns, index % columns] for index in range(count)]
+    quality = grid[0, 1].subgridspec(2, 2, height_ratios=(1.05, .95), wspace=.34, hspace=.16)
+    successful = [item for item in frames if item.failure is None]
+    failures = count-len(successful)
+    status = 'PARTIAL SUCCESS: ' if failures and successful else ''
+    figure.suptitle(f'QAC {VERSION} | {status}{len(successful)}/{count} frames solved',
+                    fontsize=20, y=.99, color='#a51d1d' if failures else 'black')
+    figure.text(.5, .945, title, ha='center', fontsize=13)
+
+    # Reuse calibrated field rendering, but give failed frames plain pixel axes and red borders.
+    colors, residuals, scales, handles = [], [], [], []
+    for index, item in enumerate(frames):
+        color = ('#c62828' if item.failure is not None else
+                 PLOT_FRAME_COLORS[(item.number-1) % len(PLOT_FRAME_COLORS)])
+        colors.append(color)
+        compact = not (merged_layout and index == count-1)
+        if item.failure is not None:
+            axis = figure.add_subplot(slots[index])
+            draw_failed_field(axis, item.image, item.failure, compact=compact)
+            residuals.append(None)
+            scales.append(None)
+        else:
+            # Give successful panels a common sky orientation; keep statistics in their native grids.
+            image, display_wcs = north_up_diagnostic(item.image, item.display_wcs)
+            axis = figure.add_subplot(slots[index], projection=display_wcs)
+            positions, _ = diagnostic_positions(display_wcs, item.solution, item.data)
+            draw_diagnostic_field(axis, image, display_wcs, positions, item.data.matches,
+                                  legend=False, compact=compact,
+                                  requested_center=item.data.requested_center,
+                                  pointing_measurement=(item.display_wcs, item.image.shape))
+            if not handles:
+                handles, _ = axis.get_legend_handles_labels()
+            residuals.append(diagnostic_residuals(item.solution, item.data.sources, item.data.matches))
+            scales.append(float(np.sqrt(abs(np.linalg.det(item.display_wcs.pixel_scale_matrix)))*3600))
+        axis.set_title(f'q{item.number} | {item.frame.label}', fontsize=11 if compact else 13,
+                       color=color, weight='bold', pad=7)
+
+    # Put the shared key into the narrow header strip, freeing every image tile for data.
+    labels = ['Final fit matches', 'Up to 10 brightest detections per frame'] if handles else []
+    if failures:
+        handles.append(Patch(facecolor='none', edgecolor='#c62828', linewidth=2))
+        labels.append('Failed frame (pixel axes)')
+    figure.legend(handles, labels, loc='upper left', bbox_to_anchor=(.045, .937),
+                   fontsize=10, ncol=len(labels), frameon=False)
+
+    # Preserve failed rows without inventing counts, WCS scales, or low residual values.
+    summary = figure.add_subplot(quality[0, :])
+    scatter = figure.add_subplot(quality[1, 0])
+    comparison = figure.add_subplot(quality[1, 1])
+    summary.set_axis_off()
+    catalogs = list(dict.fromkeys(item.data.catalog_label for item in successful))
+    models = list(dict.fromkeys(f'SIP {item.solution.sip.a_order}' if item.solution.sip else 'TAN'
+                               for item in successful))
+    times = list(dict.fromkeys(item.data.obstime.utc.isot[:19] if item.data.obstime is not None
+                              else 'unavailable' for item in successful))
+    observed = times[0] if len(times) == 1 else ('varies' if times else 'unavailable')
+    summary.text(0, 1, f'Reference: {", ".join(catalogs) or "unavailable"}\n'
+                 f'Model: {", ".join(models) or "unavailable"} | Instrument: {instrument or "unspecified"}\n'
+                 f'Observation (UTC): {observed}\n'
+                 'RMS / Check / P90: arcsec; Check = held-out refit',
+                 va='top', fontsize=11.5, linespacing=1.4)
+    table_rows, fit_rms, check_rms = [], [], []
+    for item, errors, scale in zip(frames, residuals, scales, strict=True):
+        label = item.frame.name or (f'plane {item.frame.plane+1}' if item.frame.plane is not None else 'image')
+        if item.failure is not None:
+            table_rows.append([f'q{item.number} {label}', 'FAILED', '—', '—', '—', '—'])
+            fit_rms.append(np.nan)
+            check_rms.append(np.nan)
+            continue
+        radial = errors[2]
+        rms = float(np.sqrt(np.mean(radial**2)))
+        validation = item.data.matches.validation_rms
+        fit_rms.append(rms)
+        check_rms.append(validation if validation is not None else np.nan)
+        table_rows.append([f'q{item.number} {label}',
+                           f'{len(radial)}/{len(item.data.sources)}/{item.data.reference_count}',
+                           f'{rms:.3f}', f'{validation:.3f}' if validation is not None else '—',
+                           f'{np.percentile(radial, 90):.3f}', f'{scale:.4f}'])
+    table_height = min(.62, .10*(count+1))
+    table = summary.table(cellText=table_rows,
+                          colLabels=['Frame', 'Fit/det/ref', 'RMS', 'Check', 'P90', '″/px'],
+                          colWidths=[.24, .24, .13, .13, .12, .14], cellLoc='center',
+                          bbox=[0, .66-table_height, 1, table_height])
+    table.auto_set_font_size(False)
+    table.set_fontsize(11.5)
+    for (row, column), cell in table.get_celld().items():
+        cell.set_edgecolor('#cccccc')
+        if row == 0:
+            cell.set_facecolor('#eeeeee')
+            cell.get_text().set_weight('bold')
+        elif column == 0:
+            cell.set_facecolor(colors[row-1])
+            cell.get_text().set_color('white')
+        elif frames[row-1].failure is not None:
+            cell.set_facecolor('#ffebee')
+            cell.get_text().set_color('#a51d1d')
+
+    # Failed frames never enter either quality graph; their rows remain visible in red.
+    if successful:
+        maximum = .05
+        for item, errors, color in zip(frames, residuals, colors, strict=True):
+            if errors is None:
+                continue
+            east, north, _ = errors
+            scatter.scatter(east, north, s=18, color=color, alpha=.75, linewidths=0,
+                             label=f'q{item.number}')
+            maximum = max(maximum, 1.15*float(np.max(np.abs(np.r_[east, north]))))
+        scatter.set(xlim=(-maximum, maximum), ylim=(-maximum, maximum),
+                    xlabel='East residual (arcsec)', ylabel='North residual (arcsec)',
+                    title='Observed minus reference')
+        scatter.set_aspect('equal', adjustable='box')
+        scatter.axhline(0, color='#888888', lw=.7)
+        scatter.axvline(0, color='#888888', lw=.7)
+        scatter.grid(alpha=.18)
+        scatter.legend(loc='upper right', fontsize=9, ncol=2)
+        locations = np.arange(count)
+        comparison.barh(locations-.17, fit_rms, height=.30, color=colors, label='Fit')
+        comparison.barh(locations+.17, check_rms, height=.30, color=colors, alpha=.35,
+                         hatch='///', label='Held-out')
+        for location, item in enumerate(frames):
+            if item.failure is not None:
+                comparison.text(.025, location, 'FAILED', color='#a51d1d', weight='bold',
+                                 transform=comparison.get_yaxis_transform(), va='center', fontsize=10)
+        comparison.set_yticks(locations, [f'q{item.number}' for item in frames])
+        # NaN failure bars do not autoscale; reserve a full row for every selected frame.
+        comparison.set_ylim(count-.5, -.5)
+        comparison.set(xlabel='Radial RMS (arcsec)', title='RMS by frame')
+        comparison.grid(axis='x', alpha=.18)
+        comparison.legend(handles=[Patch(facecolor='#666666', label='Fit'),
+                                   Patch(facecolor='#dddddd', hatch='///', label='Held-out')],
+                           loc='best', fontsize=9)
+        for axis in (scatter, comparison):
+            axis.tick_params(labelsize=10)
+            axis.xaxis.label.set_size(11)
+            axis.yaxis.label.set_size(11)
+            axis.title.set_size(12)
+    else:
+        # A page can contain only failures even though other pages contain valid calibrations.
+        for axis, message in ((scatter, 'No solved frames\non this page'),
+                              (comparison, 'Failed frames excluded\nfrom quality statistics')):
+            axis.set_axis_off()
+            axis.text(.5, .5, message, color='#a51d1d', ha='center', va='center', fontsize=13)
+
+    # Keep interpretation notes in the footer rather than occupying an entire field-sized tile.
+    note = ('Failed frames retain unverified input WCS.' if failures else
+            'Validation stars are included in the final fits.')
+    figure.text(.5, .025, 'Independent fits; residuals measure reference-catalogue agreement. '
+                + note, ha='center', fontsize=11)
+    return figure
+
+
+# Publish a staged artifact using the FITS output's established replacement policy.
+def publish_staged(staged: Path, target: Path, *, overwrite: bool) -> None:
+    if overwrite:
+        staged.replace(target)
+    else:
+        # A hard link prevents replacement even if another file appears during solving.
+        try:
+            target.hardlink_to(staged)
+        except FileExistsError as exc:
+            raise QACError(f'Output already exists: {target} (use --overwrite)') from exc
+
+
+# Try existing brightness groups and orientations with the selected initial matcher, retaining accepted pairs.
 def match_in_magnitude_order(sources: np.ndarray, refs: np.ndarray, sky: SkyCoord,
                              shape: tuple[int,int], initial: WCS,
                              scale_range: tuple[float,float], modes: tuple[str,...],
                              distortion: int | None,
-                             source_limit: int = 80) -> tuple[WCS, int, float, str]:
+                             source_limit: int = 80, *,
+                             diagnostics: MatchDiagnostics | None = None,
+                             match_method: str = 'pair',
+                             scamp_config: ScampConfig | None = None) -> tuple[WCS, int, float, str]:
     if len(refs) < MIN_MATCHES:
         raise QACError(f"Only {len(refs)} catalogue stars project near the image; need at least {MIN_MATCHES}")
     failures = []
     best = None
     strong_match = max(25, min(40, len(sources)//2), {None: 0, 2: 25, 3: 40}[distortion])
-    for start, stop in magnitude_seed_groups(len(refs)):
+
+    # Record only the winning candidate; virtual flips never reorder source indices.
+    def finish(result: tuple) -> tuple[WCS, int, float, str]:
+        fitted, count, rms, mode, validation_rms, si, ri = result
+        if distortion is None and validation_rms is not None:
+            print(f'  Held-out TAN RMS: {validation_rms:.3f} arcsec', flush=True)
+        if diagnostics is not None:
+            diagnostics.source_indices = si.copy()
+            diagnostics.reference_sky = sky[ri].copy()
+            diagnostics.validation_rms = validation_rms
+        return fitted, count, rms, mode
+
+    # Keep candidate ranking and early acceptance identical with or without plots.
+    reference_limit = (scamp_config.max_references if match_method == 'scamp' and scamp_config is not None else 180)
+    for start, stop in magnitude_seed_groups(len(refs), reference_limit):
         print(f"  Matching catalogue stars ranked {start+1}-{stop} by brightness ...", flush=True)
         seeds = np.arange(start, stop)
         candidates = []
@@ -1117,7 +2547,10 @@ def match_in_magnitude_order(sources: np.ndarray, refs: np.ndarray, sky: SkyCoor
                 oriented_sources = flip_points(sources, shape, mode)
                 fitted, count, rms, si, ri = fit_solution(
                     oriented_sources, refs, sky, shape, initial,
-                    scale_range, seeds, source_limit)
+                    scale_range, seeds, source_limit,
+                    **({'match_method': match_method,
+                        **({'scamp_config': scamp_config} if match_method == 'scamp' else {})}
+                       if match_method != 'pair' else {}))
                 validation_rms = (validate_linear_solution(oriented_sources, sky, si, ri, fitted)
                                   if distortion is None else None)
             except QACError as exc:
@@ -1129,32 +2562,337 @@ def match_in_magnitude_order(sources: np.ndarray, refs: np.ndarray, sky: SkyCoor
                                                            key=lambda row: (row[0], row[1])):
             if distortion is not None:
                 try:
+                    # SIP validation uses original detector pixels, as does its final fit.
+                    sip_details = MatchDiagnostics() if diagnostics is not None else None
                     fitted, count, rms = fit_sip_distortion(
-                        sources, sky, si, ri, shape, distortion, fitted)
+                        sources, sky, si, ri, shape, distortion, fitted,
+                        diagnostics=sip_details)
+                    validation_rms = sip_details.validation_rms if sip_details is not None else None
                 except QACError as exc:
                     failures.append(f"SIP {distortion}: {exc}")
                     continue
             if best is None or (count, -rms) > (best[1], -best[2]):
-                best = (fitted, count, rms, mode, validation_rms)
+                best = (fitted, count, rms, mode, validation_rms, si, ri)
             if count >= strong_match:
-                if validation_rms is not None:
-                    print(f'  Held-out TAN RMS: {validation_rms:.3f} arcsec', flush=True)
-                return fitted, count, rms, mode
+                return finish((fitted, count, rms, mode, validation_rms, si, ri))
     if best is not None:
-        if best[4] is not None:
-            print(f'  Held-out TAN RMS: {best[4]:.3f} arcsec', flush=True)
-        return best[:4]
+        return finish(best)
     raise QACError('No reliable catalogue match: ' + '; '.join(failures[-4:]))
 
 
-def solve(args: argparse.Namespace) -> Path:
+# Reuse the initializer's orientation and scale rules for four independent half-side trial pointings.
+def bad_pointing_windows(hdul: fits.HDUList, frame: Frame, shape: tuple[int, int],
+                         initial: WCS) -> list[tuple[str, WCS]]:
+    center, shorter_side = field_geometry(initial, shape)
+    scale = float(np.sqrt(abs(np.linalg.det(initial.pixel_scale_matrix))) * 3600)
+    windows = [('original', initial)]
+    # Supply the already resolved scale so presets and their binning are applied exactly once per frame.
+    for label, bearing in BAD_POINTING_BEARINGS:
+        trial_center = center.directional_offset_by(bearing*u.deg, BAD_POINTING_FRACTION*shorter_side)
+        trial, _ = initial_wcs(hdul, frame, shape, trial_center, scale)
+        # An inherited SIP origin can displace the centre after initialization; correct only the sky reference.
+        for _ in range(6):
+            measured, _ = field_geometry(trial, shape)
+            if measured.separation(trial_center).arcsec < 1e-7:
+                break
+            east, north = measured.spherical_offsets_to(trial_center)
+            reference = SkyCoord(trial.wcs.crval[0]*u.deg, trial.wcs.crval[1]*u.deg,
+                                 frame=trial_center.frame.replicate_without_data())
+            corrected = reference.spherical_offsets_by(east, north)
+            trial.wcs.crval = [corrected.ra.deg, corrected.dec.deg]
+        else:
+            raise QACError(f'Cannot centre the {label} shifted pointing window')
+        windows.append((label, trial))
+    return windows
+
+
+# Enclose all normal selection windows in one original-centred cone, with a one-arcminute buffer.
+def bad_pointing_radius(windows: list[tuple[str, WCS]], shape: tuple[int, int],
+                        center: SkyCoord, minimum: u.Quantity) -> u.Quantity:
+    left, right, bottom, top = catalog_window_bounds(shape)
+    # Sample entire boundaries to account for inherited non-linear WCS, rather than only four corners.
+    x_edge = np.linspace(left, right, 65)
+    y_edge = np.linspace(bottom, top, 65)
+    x = np.r_[x_edge, x_edge, np.full(65, left), np.full(65, right)]
+    y = np.r_[np.full(65, bottom), np.full(65, top), y_edge, y_edge]
+    radius = minimum
+    for _, trial in windows:
+        separations = center.separation(trial.pixel_to_world(x, y))
+        if not np.all(np.isfinite(separations.arcsec)):
+            raise QACError('Cannot determine the catalogue coverage for shifted pointing windows')
+        radius = max(radius, max(separations)+1*u.arcmin)
+    return radius
+
+
+# Solve and optionally resample one frame so expected failures can be isolated by the caller.
+def solve_frame(hdul: fits.HDUList, frame: Frame, args: argparse.Namespace,
+                coords: SkyCoord | None, provider: CatalogProvider
+                ) -> tuple[WCS, FrameDiagnostics | None, tuple[np.ndarray, WCS] | None]:
+    print(f"Solving {frame.label} ...", flush=True)
+    image = image_of(hdul, frame)
+    # Resolve the opt-in seed algorithm once; legacy programmatic callers retain pair matching.
+    match_method = getattr(args, 'match', 'pair')
+    if match_method not in MATCH_METHODS:
+        raise QACError(f'Unknown initial matching method: {match_method}')
+    if match_method != 'pair':
+        print(f'  Initial matching method: {match_method}', flush=True)
+    scamp_config = (ScampConfig(max_sources=getattr(args, 'scamp_sources', None),
+                                max_references=getattr(args, 'scamp_references', None) or 180)
+                    if match_method == 'scamp' else None)
+    # Estimate by default, while retaining fixed guesses and an explicit legacy retry.
+    selected_fwhm = getattr(args, 'fwhm', ESTIMATE_STAR_FWHM)
+    fwhm_trials = (DEFAULT_STAR_FWHM, 6.0)
+    if selected_fwhm is ESTIMATE_STAR_FWHM:
+        try:
+            estimated_fwhm, star_count = estimate_stellar_fwhm(image)
+        except QACError as exc:
+            print(f'  Stellar FWHM estimation unavailable ({exc}); trying 3 then 6 pixels ...',
+                  flush=True)
+        else:
+            print(f'  Estimated stellar FWHM {estimated_fwhm:.1f} pixels '
+                  f'from {star_count} suitable sources', flush=True)
+            fwhm_trials = (estimated_fwhm,) + tuple(
+                width for width in fwhm_trials if abs(width - estimated_fwhm) >= 0.25)
+    elif selected_fwhm is not None:
+        fwhm_trials = (selected_fwhm,)
+    source_cache: dict[float, np.ndarray] = {}
+    detection_errors: dict[float, QACError] = {}
+
+    # Detect each stellar profile size at most once across catalogue-depth and radius retries.
+    def sources_for(fwhm: float) -> np.ndarray:
+        if fwhm in detection_errors:
+            raise detection_errors[fwhm]
+        if fwhm not in source_cache:
+            try:
+                source_cache[fwhm] = (detect_sources(image) if fwhm == DEFAULT_STAR_FWHM
+                                      else detect_sources(image, fwhm))
+            except QACError as exc:
+                detection_errors[fwhm] = exc
+                raise
+        return source_cache[fwhm]
+
+    # Recover from too few initial detections before spending time on a catalogue query.
+    retry_reported = False
+    detection_failures = []
+    for index, fwhm in enumerate(fwhm_trials):
+        try:
+            initial_source = sources_for(fwhm)
+            break
+        except QACError as exc:
+            if not isinstance(exc, InsufficientSources) or index == len(fwhm_trials) - 1:
+                if detection_failures:
+                    detection_failures.append(f'{fwhm:g} pixels: {exc}')
+                    raise QACError('Source detection failed at all FWHM guesses: ' +
+                                   '; '.join(detection_failures)) from exc
+                raise
+            detection_failures.append(f'{fwhm:g} pixels: {exc}')
+            following = fwhm_trials[index + 1]
+            print(f'  Trying stellar FWHM {following:g} pixels after too few detections '
+                  f'at {fwhm:g} pixels ...', flush=True)
+            retry_reported = True
+    # The shared initializer applies explicit scale, then preset, then header values.
+    initial, assumed_scale = initial_wcs(
+        hdul, frame, image.shape, coords, args.scale, args.instrument)
+    center = initial.pixel_to_world((image.shape[1]-1)/2, (image.shape[0]-1)/2)
+    corners = initial.pixel_to_world([0, image.shape[1]-1, 0, image.shape[1]-1],
+                                     [0, 0, image.shape[0]-1, image.shape[0]-1])
+    corner_radius = max(center.separation(corners))
+    wide_radius = corner_radius * (1.8 if assumed_scale else 1.3) + 1*u.arcmin
+    radius = (corner_radius * 1.1 + .3*u.arcmin
+              if args.instrument and not assumed_scale else wide_radius)
+    # Only an automatic, smaller instrument cone permits the historical wider-radius retry.
+    allow_wider_retry = bool(args.instrument) and not assumed_scale and args.radius is None
+    # An explicit cone replaces automatic sizing for every provider.
+    if args.radius is not None:
+        radius = args.radius * u.arcmin
+    # Opt-in recovery uses one shared cone; an explicit radius remains the original-centred boundary.
+    bad_pointing = getattr(args, 'bad_pointing', False)
+    windows = bad_pointing_windows(hdul, frame, image.shape, initial) if bad_pointing else []
+    if bad_pointing and args.radius is None:
+        radius = bad_pointing_radius(windows, image.shape, center, wide_radius)
+    if args.instrument:
+        field = INSTRUMENTS[args.instrument].field
+        width = image.shape[1] * np.linalg.norm(initial.pixel_scale_matrix[:, 0]) * 60
+        height = image.shape[0] * np.linalg.norm(initial.pixel_scale_matrix[:, 1]) * 60
+        if max(width, height) > field * 1.4:
+            print(f"  WARNING: image footprint {width:.1f} x {height:.1f} arcmin "
+                  f"exceeds the nominal {args.instrument} field ({field:g} arcmin); "
+                  "check the scale or binning", flush=True)
+    obstime = exposure_time(hdul, frame)
+    flip = (args.flip if args.flip is not None else
+            INSTRUMENTS[args.instrument].flip if args.instrument else '')
+    modes = ('', 'x', 'y', 'xy') if flip == 'auto' else (flip,)
+    distortion = args.distortion if args.distortion is not None else (2 if args.resample else None)
+    # Try remaining stellar-profile guesses after a match failure, reusing references.
+    def attempt(reference: ReferenceCatalog) -> tuple:
+        nonlocal retry_reported
+        # SCAMP searches every fetched reference on a linear local tangent plane, including off-detector positions.
+        matching_wcs = scamp_tangent_wcs(initial, image.shape) if match_method == 'scamp' else initial
+        refxy, sky = (catalog_pixels(reference, matching_wcs, image.shape, clip=False)
+                      if match_method == 'scamp' else catalog_pixels(reference, matching_wcs, image.shape))
+        # More image detections cannot help a cone with too few projected references.
+        if len(refxy) < MIN_MATCHES:
+            raise QACError(f'Only {len(refxy)} catalogue stars project near the image; '
+                           f'need at least {MIN_MATCHES}')
+        failures = []
+        for index, fwhm in enumerate(fwhm_trials):
+            try:
+                source = sources_for(fwhm)
+                details = MatchDiagnostics() if args.plot else None
+                fitted, count, rms, mode = match_in_magnitude_order(
+                    source, refxy, sky, image.shape, matching_wcs,
+                    (0.5, 1.8) if assumed_scale else (0.75, 1.25), modes, distortion,
+                    200 if isinstance(provider, (PanSTARRS1, AllWISE)) else 80,
+                    diagnostics=details,
+                    **({'match_method': match_method,
+                        **({'scamp_config': scamp_config} if match_method == 'scamp' else {})}
+                       if match_method != 'pair' else {}))
+            except QACError as exc:
+                if len(fwhm_trials) == 1:
+                    raise
+                failures.append(f'{fwhm:g} pixels: {exc}')
+                if index < len(fwhm_trials) - 1 and not retry_reported:
+                    following = fwhm_trials[index + 1]
+                    print(f'  Trying stellar FWHM {following:g} pixels after the '
+                          f'{fwhm:g}-pixel match failed ...', flush=True)
+                    retry_reported = True
+                continue
+            return fitted, count, rms, mode, len(refxy), details, source, fwhm
+        raise QACError('Astrometric matching failed at all FWHM guesses: ' + '; '.join(failures))
+
+    # Cache each depth only in bad-pointing mode, retaining Gaia's depth/cap state alongside its rows.
+    reference_cache = {}
+
+    # Query at the original centre even while the matching window moves; never crop cached rows per trial.
+    def references_at(query_radius: u.Quantity, *, deep: bool = False) -> ReferenceCatalog:
+        if bad_pointing and deep in reference_cache:
+            reference, attributes = reference_cache[deep]
+        else:
+            # Omit the deep keyword for providers that implement only the ordinary query interface.
+            options = {'deep': True} if deep else {}
+            try:
+                reference = provider.query(center, query_radius, obstime, **options)
+            except CatalogUnavailable:
+                raise
+            except QACError as exc:
+                if not bad_pointing:
+                    raise
+                reference = exc
+            if not bad_pointing:
+                return reference
+            attributes = {name: getattr(provider, name) for name in ('last_upper', 'last_capped')
+                          if hasattr(provider, name)}
+            reference_cache[deep] = reference, attributes
+        for name, value in attributes.items():
+            setattr(provider, name, value)
+        if isinstance(reference, QACError):
+            raise reference
+        return reference
+
+    # Preserve the existing Gaia depth selection together with its diagnostics at every trial centre.
+    def solve_at(query_radius: u.Quantity) -> tuple[tuple, ReferenceCatalog]:
+        catalog = references_at(query_radius)
+        first_error = None
+        try:
+            result = attempt(catalog)
+        except QACError as exc:
+            first_error = exc
+            result = None
+        weak_limit = min(20, max(12, len(result[6] if result is not None else initial_source)//3))
+        deepen = (isinstance(provider, GaiaDR3) and args.mag is None and
+                  not provider.last_capped and
+                  provider.last_upper < GAIA_DEFAULT_FAINT_MAG and
+                  (result is None or result[1] < weak_limit))
+        if deepen:
+            print("  Extending the Gaia faint limit to 20 ...", flush=True)
+            try:
+                deeper_catalog = references_at(query_radius, deep=True)
+                deeper_result = attempt(deeper_catalog)
+            except CatalogUnavailable as exc:
+                if result is None:
+                    raise
+                print(f"  Deeper Gaia query failed; retaining the initial match: {exc}", flush=True)
+            except QACError as exc:
+                if result is None:
+                    raise QACError(f"Gaia matching failed at both depths: {first_error}; {exc}") from exc
+                print(f"  Deeper Gaia retry failed; retaining the initial match: {exc}", flush=True)
+            else:
+                if result is None or (deeper_result[1], -deeper_result[2]) > (result[1], -result[2]):
+                    result, catalog = deeper_result, deeper_catalog
+        if result is None:
+            raise first_error
+        return result, catalog
+
+    if bad_pointing:
+        # Exhaust ordinary depth/profile retries at each window and stop at the first validated solution.
+        failures = []
+        for label, initial in windows:
+            displacement = 'original centre' if label == 'original' else f'{label}, 50% of shorter field side'
+            print(f'  Bad-pointing trial: {displacement}; shared cone {radius.to_value(u.arcmin):.2f} arcmin ...',
+                  flush=True)
+            try:
+                result, catalog = solve_at(radius)
+            except CatalogUnavailable:
+                raise
+            except QACError as exc:
+                failures.append(f'{label}: {exc}')
+                print(f'  Bad-pointing trial {label} failed: {exc}', flush=True)
+                continue
+            print(f'  Bad-pointing solution accepted at {displacement}', flush=True)
+            break
+        else:
+            raise QACError('Original and all four shifted pointing windows failed: ' + '; '.join(failures))
+    else:
+        # Keep the historical instrument search and optional wider-radius retry unchanged without the flag.
+        try:
+            result, catalog = solve_at(radius)
+        except CatalogUnavailable:
+            raise
+        except QACError as first_error:
+            if not allow_wider_retry:
+                raise
+            print("  Retrying with a wider catalogue search ...", flush=True)
+            try:
+                result, catalog = solve_at(wide_radius)
+            except QACError as exc:
+                raise QACError(f"Instrument search and wider retry failed: {first_error}; {exc}") from exc
+    fitted, count, rms, mode, reference_count, details, source, fwhm_used = result
+    fitted_scale = np.sqrt(abs(np.linalg.det(fitted.pixel_scale_matrix))) * 3600
+    print(f"  {len(source)} detected, {reference_count} {catalog.label} references; "
+          f"{count} matches; RMS {rms:.3f} arcsec; scale {fitted_scale:.4f} arcsec/pixel; "
+          f"orientation {mode or 'normal'}; stellar FWHM guess {fwhm_used:g} pixels; WCS "
+          f"{'SIP ' + str(distortion) if distortion is not None else 'TAN'}")
+    # Prepare output pixels here so a resampling failure affects only this frame.
+    prepared = None
+    if args.resample:
+        print(f"  Resampling {frame.label} onto a TAN grid ...", flush=True)
+        try:
+            prepared = resample_image(image_of(hdul, frame, dtype=None), fitted)
+        except (QACError, ValueError, OSError) as exc:
+            raise QACError(f'Resampling failed: {exc}') from exc
+    # Report explicit requested-to-solved separation even when PNG plotting was not requested.
+    if coords is not None:
+        _, separation, fraction = pointing_offset(prepared[1] if prepared is not None else fitted,
+                                                   image.shape, coords)
+        flag = ' [exceeds 5%]' if fraction > POINTING_OFFSET_THRESHOLD else ''
+        print(f'  Requested -c to solved centre: {separation:.2f} arcsec; '
+              f'{100*fraction:.2f}% of shorter FoV{flag}', flush=True)
+    details = (FrameDiagnostics(source, details, catalog.label, reference_count, obstime, coords)
+               if args.plot else None)
+    return fitted, details, prepared
+
+
+# Attempt selected frames independently and publish complete or partial output bundles.
+def solve(args: argparse.Namespace, *, status: SolveStatus | None = None) -> Path:
+    status = SolveStatus() if status is None else status
     path = Path(args.image)
     if not path.is_file():
         raise QACError(f"Input file does not exist: {path}")
     coords = parse_coordinates(*args.coordinates) if args.coordinates else None
     catalog_name = args.catalog.lower()
     band = args.band.upper() if args.band else None
-    mag_min = args.mag[0] if args.mag is not None and len(args.mag) == 2 else DEFAULT_BRIGHT_MAG
+    mag_min = (args.mag[0] if args.mag is not None and len(args.mag) == 2 else
+               catalog_bright_limit(catalog_name, args.band))
     mag_max = args.mag[-1] if args.mag is not None else None
     if band == 'K':
         band = 'KS'
@@ -1173,12 +2911,26 @@ def solve(args: argparse.Namespace) -> Path:
         ps1_band = (args.band or 'r').lower()
         if ps1_band not in PS1_BANDS:
             raise QACError("PS1 --band must be g, r, i, z, or y")
-        ps1_min = args.mag[0] if args.mag is not None and len(args.mag) == 2 else 15.0
-        provider = PanSTARRS1(band=ps1_band, min_mag=ps1_min,
-                              mag_limit=mag_max if mag_max is not None else 21.0)
+        provider = PanSTARRS1(band=ps1_band, min_mag=mag_min,
+                              mag_limit=mag_max if mag_max is not None else PS1_DEFAULT_FAINT_MAG)
+    elif catalog_name == 'allwise':
+        band = band or 'W1'
+        if band not in ALLWISE_COLUMNS:
+            raise QACError('AllWISE --band must be W1, W2, W3, or W4')
+        provider = AllWISE(band=band, mag_limit=mag_max, min_mag=mag_min)
+    elif catalog_name == 'ucac5':
+        band = band or 'G'
+        if band not in UCAC5_COLUMNS:
+            raise QACError('UCAC5 --band must be G, R, J, H, or Ks')
+        provider = UCAC5(band=band, mag_limit=mag_max, min_mag=mag_min)
+    elif catalog_name == 'gsc3.3':
+        if band is not None:
+            raise QACError('GSC 3.3 uses its native mixed-band mag; --band is not supported')
+        provider = GSC33(mag_limit=mag_max if mag_max is not None else GAIA_DEFAULT_FAINT_MAG,
+                         min_mag=mag_min)
     else:
         if band is not None or args.mag is not None:
-            raise QACError("--band and --mag require --catalog gaia, 2mass, or ps1")
+            raise QACError('--band and --mag require a supported remote catalogue')
         provider = LocalCatalog(Path(args.catalog))
     with fits.open(path, memmap=False) as hdul:
         frames = frames_in(hdul)
@@ -1193,108 +2945,138 @@ def solve(args: argparse.Namespace) -> Path:
         frame_number = (frames.index(selected[0]) + 1 if choice not in (None, 'all') else None)
         target = (Path(args.output) if args.output else
                   output_path(path, resampled=args.resample, frame_number=frame_number))
-        if target.resolve() == path.resolve():
-            raise QACError("Output path must differ from input")
-        if target.exists() and not args.overwrite:
-            raise QACError(f"Output already exists: {target} (use --overwrite)")
+        # Reserve combined PNG page names before detection or catalogue queries.
+        plot_pages = diagnostic_pages(target, selected) if args.plot else {}
+        if not target.parent.is_dir():
+            raise QACError(f"Output directory does not exist: {target.parent}")
+        for artifact in (target, *plot_pages):
+            if artifact.resolve() == path.resolve():
+                raise QACError("Output path must differ from input")
+            if artifact.exists() and not args.overwrite:
+                raise QACError(f"Output already exists: {artifact} (use --overwrite)")
         solutions: dict[Frame, WCS] = {}
+        plot_data: dict[Frame, FrameDiagnostics] = {}
+        # Continue after expected calibration failures, recording each frame's independent status.
+        status.selected, status.solved = len(selected), 0
+        status.failures.clear()
+        prepared_images: dict[Frame, tuple[np.ndarray, WCS]] = {}
         for frame in selected:
-            print(f"Solving {frame.label} ...", flush=True)
-            image = image_of(hdul, frame)
-            source = detect_sources(image)
-            # BFOSC is a shorthand for an explicit scale and Y flip. As with
-            # -s, its scale supersedes a stale header WCS or PIXSCALE value.
-            scale = args.scale
-            if scale is None and args.instrument == 'bfosc':
-                scale = instrument_scale(hdul, frame, 'bfosc')
-            initial, assumed_scale = initial_wcs(
-                hdul, frame, image.shape, coords, scale, args.instrument)
-            center = initial.pixel_to_world((image.shape[1]-1)/2, (image.shape[0]-1)/2)
-            corners = initial.pixel_to_world([0, image.shape[1]-1, 0, image.shape[1]-1],
-                                             [0, 0, image.shape[0]-1, image.shape[0]-1])
-            corner_radius = max(center.separation(corners))
-            wide_radius = corner_radius * (1.8 if assumed_scale else 1.3) + 1*u.arcmin
-            radius = (corner_radius * 1.1 + .3*u.arcmin
-                      if args.instrument and not assumed_scale else wide_radius)
-            if args.instrument:
-                field = INSTRUMENTS[args.instrument].field
-                width = image.shape[1] * np.linalg.norm(initial.pixel_scale_matrix[:, 0]) * 60
-                height = image.shape[0] * np.linalg.norm(initial.pixel_scale_matrix[:, 1]) * 60
-                if max(width, height) > field * 1.4:
-                    print(f"  WARNING: image footprint {width:.1f} x {height:.1f} arcmin "
-                          f"exceeds the nominal {args.instrument} field ({field:g} arcmin); "
-                          "check the scale or binning", flush=True)
-            obstime = exposure_time(hdul, frame)
-            flip = (args.flip if args.flip is not None else
-                    INSTRUMENTS[args.instrument].flip if args.instrument else '')
-            modes = ('', 'x', 'y', 'xy') if flip == 'auto' else (flip,)
-            distortion = args.distortion if args.distortion is not None else (2 if args.resample else None)
-            def attempt(reference: ReferenceCatalog) -> tuple[WCS, int, float, str, int]:
-                refxy, sky = catalog_pixels(reference, initial, image.shape)
-                fitted, count, rms, mode = match_in_magnitude_order(
-                    source, refxy, sky, image.shape, initial,
-                    (0.5, 1.8) if assumed_scale else (0.75, 1.25), modes, distortion,
-                    200 if isinstance(provider, PanSTARRS1) else 80)
-                return fitted, count, rms, mode, len(refxy)
-
-            def solve_at(query_radius: u.Quantity) -> tuple[tuple[WCS, int, float, str, int], ReferenceCatalog]:
-                catalog = provider.query(center, query_radius, obstime)
-                first_error = None
-                try:
-                    result = attempt(catalog)
-                except QACError as exc:
-                    first_error = exc
-                    result = None
-                weak_limit = min(20, max(12, len(source)//3))
-                deepen = (isinstance(provider, GaiaDR3) and args.mag is None and
-                          not provider.last_capped and
-                          provider.last_upper < GAIA_DEFAULT_FAINT_MAG and
-                          (result is None or result[1] < weak_limit))
-                if deepen:
-                    print("  Extending the Gaia faint limit to 20 ...", flush=True)
-                    try:
-                        deeper_catalog = provider.query(center, query_radius, obstime, deep=True)
-                        deeper_result = attempt(deeper_catalog)
-                    except CatalogUnavailable as exc:
-                        if result is None:
-                            raise
-                        print(f"  Deeper Gaia query failed; retaining the initial match: {exc}", flush=True)
-                    except QACError as exc:
-                        if result is None:
-                            raise QACError(f"Gaia matching failed at both depths: {first_error}; {exc}") from exc
-                        print(f"  Deeper Gaia retry failed; retaining the initial match: {exc}", flush=True)
-                    else:
-                        if result is None or (deeper_result[1], -deeper_result[2]) > (result[1], -result[2]):
-                            result, catalog = deeper_result, deeper_catalog
-                if result is None:
-                    raise first_error
-                return result, catalog
-
             try:
-                result, catalog = solve_at(radius)
-            except CatalogUnavailable:
-                raise
-            except QACError as first_error:
-                if radius is wide_radius:
-                    raise
-                print("  Retrying with a wider catalogue search ...", flush=True)
-                try:
-                    result, catalog = solve_at(wide_radius)
-                except QACError as exc:
-                    raise QACError(f"Instrument search and wider retry failed: {first_error}; {exc}") from exc
-            fitted, count, rms, mode, reference_count = result
-            fitted_scale = np.sqrt(abs(np.linalg.det(fitted.pixel_scale_matrix))) * 3600
-            print(f"  {len(source)} detected, {reference_count} {catalog.label} references; "
-                  f"{count} matches; RMS {rms:.3f} arcsec; scale {fitted_scale:.4f} arcsec/pixel; "
-                  f"orientation {mode or 'normal'}; WCS "
-                  f"{'SIP ' + str(distortion) if distortion is not None else 'TAN'}")
+                fitted, details, prepared = solve_frame(hdul, frame, args, coords, provider)
+            except (QACError, ValueError, OSError) as exc:
+                reason = str(exc).strip() or type(exc).__name__
+                status.failures[frame] = reason
+                print(f'FAILED {frame.label}: {reason}', flush=True)
+                continue
             solutions[frame] = fitted
-        output_hdus(hdul, selected, solutions, resample=args.resample,
-                    extract_selected=frame_number is not None).writeto(
-            target, overwrite=args.overwrite, checksum=True)
+            if details is not None:
+                plot_data[frame] = details
+            if prepared is not None:
+                prepared_images[frame] = prepared
+        status.solved = len(solutions)
+        if not solutions:
+            last_error = list(status.failures.values())[-1]
+            raise QACError(f'No selected frames solved ({len(selected)} failed); last failure: {last_error}')
+        # Stage every artifact first; rendering errors must not publish incomplete files.
+        staged_outputs: dict[Path, Path] = {}
+        published: list[Path] = []
+        try:
+            for artifact in (target, *plot_pages):
+                with tempfile.NamedTemporaryFile(
+                    dir=artifact.parent, prefix=f'.{artifact.name}.', suffix='.tmp', delete=False
+                ) as temporary:
+                    staged_outputs[artifact] = Path(temporary.name)
+            with output_hdus(hdul, selected, solutions, resample=args.resample,
+                             extract_selected=frame_number is not None, failures=status.failures,
+                             prepared=prepared_images) as output:
+                # Distinguish overall run status from individual image calibration status.
+                output[0].header['QACVER'] = (VERSION, 'QAC software version')
+                output[0].header['QACRUN'] = ('PARTIAL' if status.failures else 'COMPLETE', 'QAC run status')
+                output[0].header['QACNSEL'] = (status.selected, 'Selected image frames')
+                output[0].header['QACNSOL'] = (status.solved, 'Successfully calibrated frames')
+                output[0].header['QACNFAI'] = (len(status.failures), 'Failed selected frames')
+                output.writeto(staged_outputs[target], overwrite=True, checksum=True)
+                # Plot the exact output pixels and WCS, including selected and resampled frames.
+                if args.plot:
+                    output_frames = dict(zip(selected, frames_in(output), strict=True))
+                    for page_number, (plot_path, page_frames) in enumerate(plot_pages.items(), 1):
+                        try:
+                            page_title = path.name
+                            if len(plot_pages) > 1:
+                                page_title += f' | page {page_number}/{len(plot_pages)}'
+                            if len(page_frames) == 1 and page_frames[0] in solutions:
+                                # Keep the established full-size diagnostic for one selected frame.
+                                frame = page_frames[0]
+                                output_frame = output_frames[frame]
+                                frame_title = (f'q{frames.index(frame)+1} | {frame.label}'
+                                               if len(plot_pages) > 1 else frame.label)
+                                figure = diagnostic_figure(
+                                    image_of(output, output_frame), WCS(output[output_frame.hdu].header),
+                                    solutions[frame], plot_data[frame],
+                                    title=f'{page_title} | {frame_title}', instrument=args.instrument,
+                                    north_up=args.cube is not None)
+                            else:
+                                # Bound rendering memory to one page and reuse each frame's final pairs.
+                                page_data = [DiagnosticFrame(
+                                    frame=frame, number=frames.index(frame)+1,
+                                    image=image_of(output, output_frames[frame]),
+                                    display_wcs=(WCS(output[output_frames[frame].hdu].header)
+                                                 if frame in solutions else None),
+                                    solution=solutions.get(frame), data=plot_data.get(frame),
+                                    failure=status.failures.get(frame)) for frame in page_frames]
+                                figure = combined_diagnostic_figure(
+                                    page_data, title=page_title, instrument=args.instrument)
+                            try:
+                                figure.savefig(staged_outputs[plot_path], format='png', dpi=160,
+                                               metadata={'Software': f'QAC {VERSION}'})
+                            finally:
+                                figure.clear()
+                        except (ImportError, OSError, ValueError, RuntimeError) as exc:
+                            raise QACError(f'Cannot create diagnostic PNG {plot_path.name}: {exc}') from exc
+            # Apply the same no-replacement rule to FITS and PNG files at publication time.
+            for artifact, staged in staged_outputs.items():
+                publish_staged(staged, artifact, overwrite=args.overwrite)
+                published.append(artifact)
+        except Exception:
+            # Undo our own newly linked files if a later artifact collides during publication.
+            if not args.overwrite:
+                for artifact in published:
+                    if artifact.exists() and artifact.samefile(staged_outputs[artifact]):
+                        artifact.unlink()
+            raise
+        finally:
+            for staged in staged_outputs.values():
+                staged.unlink(missing_ok=True)
+        # Announce plots only after all requested output files have been published.
+        for plot in plot_pages:
+            print(f'DIAGNOSTIC PNG: {plot}', flush=True)
+        # Only published PNGs reach the default viewer, including every page of a partial result.
+        for plot in plot_pages:
+            open_diagnostic(plot)
     return target
 
 
+# Launch each saved diagnostic with the system file handler without waiting for the viewer.
+def open_diagnostic(path: Path) -> None:
+    # Follow the finding-chart launch pattern, adding the native Windows file handler.
+    try:
+        if sys.platform == 'win32' and hasattr(os, 'startfile'):
+            os.startfile(str(path.resolve()))
+            return
+        command = ('open' if sys.platform == 'darwin' else
+                   'xdg-open' if sys.platform.startswith('linux') else None)
+        if command is None or shutil.which(command) is None:
+            print(f'WARNING: Cannot open diagnostic {path.name}: no supported system opener available.',
+                  file=sys.stderr)
+            return
+        # Keep the viewer independent and pass the absolute filename without shell interpretation.
+        subprocess.Popen([command, str(path.resolve())], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as exc:
+        print(f'WARNING: Could not open diagnostic {path.name}: {exc}', file=sys.stderr)
+
+
+# Parse and validate CLI options before solving and reporting the output path.
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # argparse treats a negative sexagesimal Dec as another command option.
@@ -1302,42 +3084,88 @@ def main(argv: list[str] | None = None) -> int:
     for i, arg in enumerate(argv[:-2]):
         if arg in ('-c', '--coordinates') and argv[i+2].startswith('-') and ':' in argv[i+2]:
             argv[i+2] = 'QAC_NEG_DEC_' + argv[i+2][1:]
-    parser = argparse.ArgumentParser(description="Quick Gaia DR3, PS1 DR2, 2MASS, or local-catalogue astrometry for FITS images")
+    parser = argparse.ArgumentParser(description='Quick Gaia DR3, PS1 DR2, 2MASS, AllWISE, UCAC5, GSC 3.3, or local-catalogue astrometry for FITS images')
     parser.add_argument('image', help='FITS image or multi-frame file')
     parser.add_argument('-c', '--coordinates', nargs=2, metavar=('RA','DEC'), help='approximate field centre (degrees or RA hours:minutes:seconds, Dec degrees:minutes:seconds)')
-    parser.add_argument('-s', '--scale', type=float, metavar='ARCSEC_PIXEL', help='approximate image scale in arcsec/pixel')
+    parser.add_argument('-ps', '--scale', '--pixel-scale', dest='scale',
+                        type=float, metavar='ARCSEC_PIXEL',
+                        help='approximate image pixel scale in arcsec/pixel')
+    fwhm_group = parser.add_mutually_exclusive_group()
+    fwhm_group.add_argument('--fwhm', nargs='?', default=ESTIMATE_STAR_FWHM,
+                            const=ESTIMATE_STAR_FWHM, type=float, metavar='PIXELS',
+                            help='bare or omitted: estimate stellar FWHM, then fall back to 3/6 pixels; with PIXELS: fixed guess')
+    fwhm_group.add_argument('--nofwhm', dest='fwhm', action='store_const',
+                            const=None, help='skip image-based estimation; try 3 then 6 pixels')
     parser.add_argument('-i', '--instrument', choices=tuple(INSTRUMENTS), type=str.lower,
-                        metavar='NAME', help='imaging preset: fors, mods, luci, hawki, bfosc, lbc, gmos, sifapsoft, nics; BFOSC defaults to Y flip and supersedes header scale')
-    parser.add_argument('-q', '--cube', nargs='?', const='all', metavar='FRAME', help='solve all frames, or only 1-based frame number / EXTNAME')
+                        metavar='NAME', help='imaging preset: fors, mods, luci, hawki, bfosc, lbc, gmos, sifapsoft, nics; preset scale overrides header scales unless -ps is supplied; BFOSC defaults to Y flip')
+    parser.add_argument('-q', '--cube', nargs='?', const='all', metavar='FRAME',
+                        help='attempt all frames, retaining successes and marking failures; or select 1-based frame number / EXTNAME')
     parser.add_argument('-f', '--flip', nargs='?', const='auto', choices=('auto','x','y','xy'), metavar='X|Y|XY', help='try x, y, or xy flip; bare -f tries all orientations')
-    parser.add_argument('-d', '--distorsion', '--distortion', dest='distortion', nargs='?',
+    parser.add_argument('-d', '--distortion', '--distorsion', dest='distortion', nargs='?',
                         const=2, type=int, choices=(2,3), metavar='2|3',
                         help='fit SIP distortion of degree 2 (bare -d) or 3; default linear TAN')
-    parser.add_argument('-r', '--resample', action='store_true',
+    # Radius is in arcminutes; resampling retains only its long option.
+    parser.add_argument('-r', '--radius', type=float, metavar='ARCMIN',
+                        help='catalogue cone radius in arcmin; overrides automatic sizing and disables wider-radius retries (also filters local catalogues)')
+    # Enable the tested shifted-window recovery only when explicitly requested.
+    parser.add_argument('--bad-pointing', '--bad', dest='bad_pointing', action='store_true',
+                        help='try the original window then N/E/S/W shifts of half the shorter field side; share one original-centred catalogue cone, respecting -r')
+    # Keep pair matching as the default while exposing triangle seeding as an independent alternative.
+    parser.add_argument('--match', choices=MATCH_METHODS, default='pair',
+                        help='initial star-pattern matcher: pair (default), triangle, or scamp (native pair-histogram FFT); fitting and validation are unchanged')
+    # Explicit SCAMP caps control pair-generation cost without changing default pair/triangle selection.
+    parser.add_argument('--scamp-sources', type=int, metavar='N',
+                        help='SCAMP detected-source seed cap (8..2000; default follows catalogue: 80 or 200)')
+    parser.add_argument('--scamp-references', type=int, metavar='N',
+                        help='SCAMP reference seed cap per magnitude group (8..2000; default 180)')
+    parser.add_argument('--resample', action='store_true',
                         help='rectify image pixels using SIP onto a plain TAN grid; implies -d 2')
-    parser.add_argument('--catalog', default='gaia', metavar='GAIA|PS1|2MASS|FILE', help='Gaia DR3 (default), PS1 DR2, 2MASS, or local RA DEC [MAG] text file')
-    parser.add_argument('-b', '--band', metavar='BAND', help='Gaia G/BP/RP (default RP), PS1 g/r/i/z/y (default r), or 2MASS J/H/Ks (default J)')
+    parser.add_argument('-s', '--survey', '--catalog', dest='catalog', default='gaia',
+                        metavar='SURVEY|FILE',
+                        help='reference source: gaia (Gaia DR3; default), ps1/ps, 2mass, allwise/aw, ucac5/uc, gsc3.3/gsc, or local RA DEC [MAG] text file')
+    parser.add_argument('-b', '--band', metavar='BAND', help='Gaia G/BP/RP (default RP), PS1 g/r/i/z/y (r), 2MASS J/H/Ks (J), AllWISE W1/W2/W3/W4 (W1), or UCAC5 G/R/J/H/Ks (G); GSC 3.3 uses mixed-band mag')
     parser.add_argument('-m', '--mag', type=float, nargs='+', metavar='MAG',
-                        help='faint limit MAG (bright limit 12, or 15 for PS1), or bright/faint range: -m 15 22')
+                        help='faint limit MAG with catalogue-specific bright cut, or explicit bright/faint range: -m 15 22')
     parser.add_argument('--refresh-catalog', action='store_true', help='query Gaia again instead of reading the local cache')
-    parser.add_argument('-o', '--output', help='output FITS path (default: INPUT[_qN]_astro.fits, or INPUT[_qN]_resampled.fits with -r)')
+    parser.add_argument('-p', '--plot', action='store_true',
+                        help='save diagnostic PNGs and try opening each in the system default viewer; long cubes use pages of up to six')
+    parser.add_argument('-o', '--output', help='output FITS path (default: INPUT[_qN]_astro.fits, or INPUT[_qN]_resampled.fits with --resample)')
     parser.add_argument('--overwrite', action='store_true', help='replace existing output file')
-    parser.add_argument('--version', action='version', version=f'qac {VERSION}')
+    parser.add_argument('-v', '--version', action='version', version=f'qac {VERSION}')
     args = parser.parse_args(argv)
+    status = SolveStatus()
     try:
+        # Validate strategy-specific controls before opening an input or querying any provider.
+        if args.scamp_sources is not None or args.scamp_references is not None:
+            if args.match != 'scamp':
+                raise QACError('--scamp-sources and --scamp-references require --match scamp')
+            ScampConfig(max_sources=args.scamp_sources,
+                        max_references=args.scamp_references if args.scamp_references is not None else 180)
+        # Resolve aliases before catalogue-specific magnitude defaults and provider selection.
+        args.catalog = CATALOG_ALIASES.get(args.catalog.lower(), args.catalog)
+        # Reject invalid cone sizes before reading images or querying catalogues.
+        if args.radius is not None and (not np.isfinite(args.radius) or args.radius <= 0):
+            raise QACError("-r/--radius must be finite and positive (arcmin)")
         if args.scale is not None and (not np.isfinite(args.scale) or args.scale <= 0):
-            raise QACError("-s/--scale must be positive")
+            raise QACError("-ps/--pixel-scale must be positive")
+        # Reject invalid stellar FWHM guesses before reading images or querying catalogues.
+        if args.fwhm is not None and args.fwhm is not ESTIMATE_STAR_FWHM and (
+                not np.isfinite(args.fwhm) or args.fwhm <= 0):
+            raise QACError('--fwhm must be finite and positive (pixels)')
         if args.mag is not None:
             if len(args.mag) not in (1, 2) or not np.all(np.isfinite(args.mag)):
                 raise QACError("-m/--mag requires one or two finite magnitudes")
             lower = (args.mag[0] if len(args.mag) == 2 else
-                     15.0 if args.catalog.lower() == 'ps1' else DEFAULT_BRIGHT_MAG)
+                     catalog_bright_limit(args.catalog.lower(), args.band))
             if lower >= args.mag[-1]:
                 raise QACError("-m/--mag requires a faint limit above the bright limit; "
                                "use -m BRIGHT FAINT to change the bright limit")
-        out = solve(args)
+        out = solve(args, status=status)
     except (QACError, ValueError, OSError) as exc:
         parser.exit(2, f"qac: error: {exc}\n")
+    if status.failures:
+        print(f'PARTIAL SUCCESS: {status.solved}/{status.selected} frames solved: {out}')
+        return 1
     print(f"ASTROMETRY OK: {out}")
     return 0
 
