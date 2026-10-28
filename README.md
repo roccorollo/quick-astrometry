@@ -1,7 +1,10 @@
 # QAC v7.12.0 — Quick Astrometry for FITS Images
 
 <p align="center">
-  <img src="images/example_badpointing.png" alt="Example of astrometry of a field with bad pointing" width="600">
+  <img src="images/example_badpointing.png" 
+    alt="Example of astrometry of a field with bad pointing" 
+    width="600">
+    <br>
   <em> Example of astrometry of a field with bad pointing </em>
 </p>
 
