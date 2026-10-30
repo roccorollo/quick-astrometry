@@ -1,5 +1,127 @@
 # Changelog
 
+## 9.2.4 — 2026-10-30
+
+- Restore the single-frame right column to a readable statistics block above side-by-side residual scatter and vector graphs. Preserve the left-aligned field, fonts, measurements and combined layouts.
+
+## 9.2.3 — 2026-10-30
+
+- Left-align the single-frame diagnostic field and reserve a horizontal gap before the solution header, preventing contact between the image and upper-right text. Keep image aspect ratio, fonts and combined layouts unchanged.
+
+## 9.2.2 — 2026-10-30
+
+- Preserve grid selection and priority from source-analysis pixels through original-pixel fitting and diagnostics, fixing cell reassignment near boundaries after binning.
+- Reuse the existing per-FWHM source cache for spatial priority across catalogue, radius, window and matcher retries. Remove grid rebuilding and diagnostic index remapping; non-grid selection is unchanged.
+## 9.2.1 — 2026-10-30
+
+- Remove the ten-brightest-source gold circles and their legend entries from single-frame and combined diagnostic plots. Keep cyan final-fit markers; brightness is not a measure of a star's influence on the match. Matching and grid selection are unchanged.
+
+## 9.2.0 — 2026-10-30
+
+- Add `-nd/--number-detections` to override the initial-matching detection budget, increasing the retained source limit above 200 when necessary. Existing catalogue defaults and reference brightness groups remain unchanged.
+- Add opt-in `--grid [N]` spatial detection selection (2–19 cells per side; bare: 3), reused through matching and refinement, with unused sparse-cell places redistributed. Allow `--bad` together with an uppercase warning that the combination is not tested.
+
+## 9.1.0 — 2026-10-30
+
+- Group `--resample` beside `-d/--distortion/--distorsion` in CLI help and documentation, without changing their behaviour.
+- Expose Pan-STARRS as the primary public survey name (`-s pan-starrs`, case insensitive), retaining `ps` and legacy `ps1` aliases. Update help, query messages, catalogue/plot labels and current documentation.
+- Reuse the existing Pan-STARRS1 DR2 provider, magnitude defaults, quality cuts and API without changing matching budgets or scientific calculations. This compatible survey-name addition increases the minor version.
+
+## 9.0.0 — 2026-10-30
+
+- Make `--match auto` the default: exhaust pair matching across the normal workflow and permitted wider cone, or all five bad-pointing windows, before restarting the same workflow with triangle. Stop at the first accepted window solution and retain explicit pair-only and triangle-only modes.
+- Reuse per-FWHM detections and exact radius/depth catalogue pools across methods, restoring Gaia depth metadata. Keep original pointing, explicit radii, instrument settings, scientific fitting and validation unchanged; catalogue outages do not trigger algorithm fallback.
+- Remove SCAMP and its controls from the public CLI while preserving its internal implementation, configuration, tests and benchmark records. This incompatible CLI removal requires a major version.
+- Add deterministic recovery-order, cache, restart and outage checks; report the accepted matcher in terminal summaries. Grid-based source selection remains deferred.
+- Pin the existing pointing-comparison Observer adapter to pair-only matching so its reference-policy experiments do not silently gain the new automatic strategy. Preserve recorded benchmark results.
+
+## 8.2.3 — 2026-10-30
+
+- Increase the triangle matcher's global bright-star subset from 24 to 25 stars. Keep local-neighbour triangles, candidate limits, pair matching and validation unchanged. This compatible seed-budget adjustment increases the patch version.
+
+## 8.2.2 — 2026-10-29
+
+- Change the last fallback stellar FWHM guess from 30 to 35 original-image pixels; use the shared 5/15/35 sequence in help, messages and all fallback paths.
+- When automatic elongation has insufficient suitable candidates, report its unavailability and continue with default shape handling instead of failing the frame. Preserve the twelve-candidate guard for learning a band and the independent FWHM-estimation requirements.
+- Reuse the default detection/FWHM path, including 5/15/35 original-pixel retries, fixed FWHM and `--nofwhm`. Preserve explicit numeric elongation settings and genuine image/background errors. This compatible recovery fix increases the patch version.
+
+## 8.2.1 — 2026-10-29
+
+- Treat SIFAPSOFT binning 4 and automatic elongation as defaults: explicit options override each independently, regardless of argument order. Preserve bare-option semantics and explicit programmatic values across repeated frame solves. This compatible precedence correction increases the patch version.
+
+## 8.2.0 — 2026-10-29
+
+- Make `-i sifapsoft` always select analysis binning 4 and automatic elongation, overriding other valid analysis values consistently in CLI and programmatic frame solves. Keep camera-scale handling, other instruments, source-area criteria and FWHM fallback guesses unchanged. This compatible instrument workflow change increases the minor version.
+
+## 8.1.2 — 2026-10-29
+
+- Extend fallback stellar FWHM guesses to 5, 15 and 30 original-image pixels, in that order. Reuse the same sequence after automatic-estimation or matching failure and with `--nofwhm`; preserve early success, binning conversion, detection caching and explicit fixed FWHM.
+- Derive terminal/help wording from the configured sequence and update documentation and retry regression checks. This compatible fallback adjustment increases the patch version.
+
+## 8.1.1 — 2026-10-29
+
+- Clarify the assumed camera-binning message for input images, preserving each instrument's preset value and all binning calculations. This output-wording correction increases the patch version.
+
+## 8.1.0 — 2026-10-29
+
+- Add `--elongation [MAX]`: preserve the default 1.3 FWHM cutoff, accept a numeric maximum, or learn a median/MAD band with a bare option. Require twelve bright, isolated, size-consistent candidates; use three robust scatters with a five-percent relative tolerance floor and report the measured band. Shape consistency is not stellar classification.
+- Share the candidate map and selection across FWHM fitting and detection retries, including fixed FWHM and `--nofwhm`. For nondefault shape modes, reuse moment covariance to fit rotated elongated profiles, replace DAO roundness gates with measured axis-ratio selection, and retain one DAO centre per segmented object. Preserve other quality, matching and WCS checks.
+- Make detection binning 2 the default and the bare `--binning` value. Retain explicit factors, including `--binning 1` for native analysis, original-pixel FWHM/scale semantics and unchanged output samples. This compatible configurable workflow and requested default change increase the minor version.
+- Keep Observer diagnostics in original-pixel FWHM units and record the solver's shared analysis-binning default. Update synthetic recovery fixtures to retain suitable isolated stars after averaging; preserve historical observations and recorded runs.
+- Document statistical assumptions and sampling limitations; test robust selection, sparse/zero-scatter cases, rotated profiles, shape outliers, CLI modes and offline native-grid astrometry in both supported Python environments.
+
+## 8.0.1 — 2026-10-29
+
+- Select FWHM candidates directly from cached region areas after one segmentation. Preserve the adaptive area formula, candidate footprints and all original regions as possible neighbours and fitting masks.
+- Remove the redundant second segmentation, flux-weighted cross-map association helper and unused ambiguous-region bookkeeping. Keep profile fitting, elongation restrictions, CLI behaviour and astrometric validation unchanged. This compatible performance correction increases the patch version.
+- Verify native/binned candidate-footprint equivalence against repeated segmentation, including small neighbours and masked pixels.
+
+## 8.0.0 — 2026-10-29
+
+- Remove `--smooth` and all Gaussian preprocessing/verification filters. Use one source-analysis procedure on native or explicitly binned pixels; retain DAOStarFinder and Gaussian profile modelling. Removing the CLI option is an incompatible change and requires a major version.
+- Target 256-pixel background meshes, retaining smaller meshes for small working images. Estimate a robust rough width population, adapt candidate region area in one additional segmentation at most, and retain small regions as neighbours. Preserve the 80% positive-signal association criterion without an auxiliary filtered image.
+- Simplify profile fitting from nine nonlinear parameters to six: estimate a clipped local sky plane separately and use an analytical Gaussian Jacobian. Share bounded cutout enlargement, fit-area and final-width isolation checks; retain the twelve-profile minimum and 80-candidate cap.
+- Replace the 40-pixel width cutoff with an image-derived range and a 100-working-pixel safety limit, update Gaussian sigma bounds consistently, and reject fits pinned to those bounds. Preserve original-pixel FWHM reporting, explicit FWHM, 5/15 retries, original FITS samples, instrument presets and astrometric strategies.
+- Replace smoothing-specific tests and documentation with shared native/binned source-analysis coverage. No new dependencies.
+
+## 7.16.0 — 2026-10-29
+
+- Add opt-in `--smooth [SIGMA]` Gaussian source analysis with unchanged image dimensions and original-pixel units; default sigma 1, alternative to detection binning. Fit profiles and preserve FITS pixels on the unfiltered image, correcting only the detection kernel for Gaussian blur.
+- Select larger image-dependent region areas in bounded trials using filter size and coarse stellar width. Group fragments supported by a coherent 2×2 auxiliary map, preserve ambiguous regions and faint auxiliary objects as possible neighbours, and reject multi-peaked width candidates.
+- Share cleaned labels with fitting masks and cutout limits, recheck isolation after fitting, and allow one bounded cutout enlargement with a valid-area check against `int(FWHM + 1)²`. Raise the automatic fitted-width ceiling from 30 to 40 working pixels as requested. Preserve 5/15 retries, explicit FWHM, matching strategies and WCS validation.
+- Document empirical choices and limitations, and add deterministic smoothing, blend, masking, area-adaptation and original-grid FITS/WCS checks. This compatible opt-in workflow increases the minor version without adding dependencies.
+
+## 7.15.1 — 2026-10-29
+
+- Change automatic fallback stellar FWHM trials, including `--nofwhm`, from 3/6 to 5/15 original-image pixels. Preserve the estimated width as the first attempt, explicit fixed widths, binning conversion and detection-cache reuse. Centralize the retry pair and update help and regression tests. This compatible fallback adjustment increases the patch version.
+
+## 7.15.0 — 2026-10-29
+
+- Replace threshold-truncated moment widths with robust elliptical-Gaussian fits in larger original-data cutouts, fitting a local sky plane and estimating local background scatter. Use segmentation only for candidate positions, initial sizes and neighbour masks; include sub-threshold wings in the fit.
+- Bound fitting to 80 bright candidates, reject unstable/poor profiles, and retain the final 1.5–30 working-pixel width, elongation <1.3, bright-source and twelve-profile requirements. Allow initial moment widths down to 1 pixel so truncation need not exclude a valid fitted width.
+- Distinguish bright-candidate peak selection (15 times background scatter) from fitted Gaussian peak contrast (at least 5 times local scatter), with independent shape, convergence and residual checks; neither is a formal integrated-source signal-to-noise estimate.
+- Reuse existing binning, original-pixel conversion, detection and WCS validation. Preserve explicit `--fwhm`, `--nofwhm` and the 3/6-pixel retries. This compatible estimation workflow change increases the minor version without adding dependencies.
+
+## 7.14.2 — 2026-10-29
+
+- Split plot headers into left-aligned image information and right-aligned solution metadata. Compact single-frame summaries, enlarge the field area and stack residual graphs vertically.
+- Move shared multi-frame metadata above the quality table, giving graphs more space while preserving per-frame centre/FOV labels, independent statistics and failure indicators. Retain the established font family and three sizes. This compatible layout correction increases the patch version.
+
+## 7.14.1 — 2026-10-29
+
+- Reduce the QAC plot heading and enlarge the filename/HDU and centre/FOV lines with clearer header spacing. Match centre/FOV text to the solution-summary size.
+- Standardize single- and multi-frame plots on DejaVu Sans at 9, 13 and 15 points, including axes, legends, tables and annotations. This compatible presentation correction increases the patch version.
+
+## 7.14.0 — 2026-10-29
+
+- Report `Image Center` in HMS/DMS and width × height FOV in terminal output and single-/multi-frame diagnostic plots. Use one decimal place and arcseconds below 1 arcmin on both sides, degrees above 50 arcmin on both sides, otherwise arcminutes.
+- Reuse the existing edge-midpoint geometry for pointing statistics and reports. Measure the solved output grid before diagnostic rotation/padding, including resampled outputs; do not label failed frames as calibrated. This compatible reporting feature increases the minor version.
+
+## 7.13.0 — 2026-10-29
+
+- Add opt-in `--binning FACTOR` block averaging for detection and stellar FWHM estimation; default 1 preserves existing behavior. Reuse existing background estimation, shape restrictions, detection, matching and WCS validation.
+- Map centroids back to original block centres and retain original-pixel scale/FWHM semantics, image geometry and FITS pixels. Exclude incomplete bottom/right blocks from detection and preserve invalid blocks. This compatible feature increases the minor version without adding dependencies.
+
 ## 7.12.0 — 2026-10-28
 
 - Add native `--match scamp` as a separate initial strategy; retain pair as default and leave triangle available without hidden fallback between methods.

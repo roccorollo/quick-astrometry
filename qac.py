@@ -11,6 +11,7 @@ import csv
 from dataclasses import dataclass, field
 import hashlib
 import io
+import inspect
 from itertools import combinations, permutations
 import os
 from pathlib import Path
@@ -25,11 +26,12 @@ import warnings
 import numpy as np
 import requests
 from scipy.ndimage import map_coordinates
+from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
 from astropy import units as u
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
-from astropy.stats import sigma_clipped_stats
+from astropy.stats import mad_std, sigma_clipped_stats
 from astropy.table import Table
 from astropy.time import Time
 from astropy.wcs import WCS, NoConvergence
@@ -40,9 +42,23 @@ from photutils.detection import DAOStarFinder
 from photutils.segmentation import SourceCatalog, detect_sources as segment_sources
 
 # Release identity and catalogue/matching defaults.
-VERSION = "7.12.0"
+VERSION = "9.2.4"
 MIN_MATCHES = 8
 DEFAULT_STAR_FWHM = 3.0
+# CLI and programmatic frame solving share the same source-analysis binning default.
+DEFAULT_DETECTION_BINNING = 2
+# Automatic retries remain in original-image pixels, independent of detection-only binning.
+STAR_FWHM_FALLBACKS = (5.0, 15.0, 35.0)
+# Derive help and status wording from the same ordered retry sequence.
+STAR_FWHM_FALLBACK_TEXT = ' then '.join(f'{width:g}' for width in STAR_FWHM_FALLBACKS)
+# Keep broad safety bounds separate from the stellar population measured in working-image pixels.
+MAX_STAR_FWHM = 100.0
+# Target broad background meshes while keeping several meshes on small working images.
+BACKGROUND_BOX_SIZE = 256
+GAUSSIAN_FWHM_FACTOR = 2*np.sqrt(2*np.log(2))
+# Keep the established round-star default; automatic shape selection needs a representative sample.
+DEFAULT_ELONGATION = 1.3
+MIN_SHAPE_SOURCES = 12
 # Distinguish an image-derived stellar FWHM from a fixed value or the default retry.
 ESTIMATE_STAR_FWHM = object()
 DEFAULT_BRIGHT_MAG = 12.0
@@ -59,7 +75,8 @@ ALLWISE_FAINT_LIMITS = {'W1': 16., 'W2': 15., 'W3': 11., 'W4': 8.}
 UCAC5_COLUMNS = {'G': 'Gmag', 'R': 'Rmag', 'J': 'Jmag', 'H': 'Hmag', 'KS': 'Kmag'}
 UCAC5_BRIGHT_LIMIT = 8.
 UCAC5_FAINT_LIMITS = {'G': 16., 'R': 16., **TWOMASS_DEFAULT_LIMITS}
-CATALOG_ALIASES = {'ps': 'ps1', 'aw': 'allwise', 'uc': 'ucac5', 'gsc': 'gsc3.3'}
+# Retain the PS1 implementation key and legacy spelling while exposing the Pan-STARRS survey name.
+CATALOG_ALIASES = {'pan-starrs': 'ps1', 'ps': 'ps1', 'aw': 'allwise', 'uc': 'ucac5', 'gsc': 'gsc3.3'}
 VIZIER_ROW_LIMIT = 10000
 GSC_ROW_LIMIT = 10000
 GSC_API = 'https://gsss.stsci.edu/webservices/vo/CatalogSearch.aspx'
@@ -74,8 +91,11 @@ CATALOG_WINDOW_MARGIN = .3
 
 # Bound triangle seeding while leaving correspondence refinement and scientific acceptance unchanged.
 MATCH_METHODS = ('pair', 'triangle', 'scamp')
+# Public orchestration is separate from independently testable internal seed strategies.
+CLI_MATCH_METHODS = ('auto', 'pair', 'triangle')
+DEFAULT_MATCH_METHOD = 'auto'
 TRIANGLE_NEIGHBORS = 5
-TRIANGLE_BRIGHT_LIMIT = 24
+TRIANGLE_BRIGHT_LIMIT = 25
 TRIANGLE_RATIO_TOLERANCE = .01
 TRIANGLE_MAX_CANDIDATES = 2000
 TRIANGLE_MIN_AREA_RATIO = .02
@@ -92,6 +112,10 @@ PLOT_ASINH_A = .08
 
 # Keep image tiles and per-frame statistics readable when many frames are selected.
 PLOT_FRAMES_PER_PAGE = 6
+
+# Use one portable font family and three point sizes throughout diagnostic figures.
+PLOT_FONT_FAMILY = 'DejaVu Sans'
+PLOT_FONT_SIZES = (9., 13., 15.)
 
 # Identify substantial requested-coordinate offsets relative to the shorter angular field span.
 POINTING_OFFSET_THRESHOLD = .05
@@ -216,6 +240,35 @@ class FrameDiagnostics:
     requested_center: SkyCoord | None = None
 
 
+# Express explicit or measured elongation limits independently of detection and Gaussian profile fitting.
+@dataclass
+class ElongationSelection:
+    minimum: float = 1.
+    maximum: float = DEFAULT_ELONGATION
+    median: float | None = None
+    scatter: float | None = None
+
+    # Reject undefined shapes and select axis ratios within the shared lower/upper interval.
+    def accepts(self, elongation: np.ndarray) -> np.ndarray:
+        return np.isfinite(elongation) & (elongation >= self.minimum) & (elongation < self.maximum)
+
+
+# Share background, candidate labels and adaptive areas on either the native or explicitly binned image.
+@dataclass
+class SourceAnalysis:
+    data: np.ndarray
+    valid: np.ndarray
+    labels: np.ndarray
+    noise: float
+    catalogue: SourceCatalog
+    eligible: np.ndarray
+    area: int
+    coarse_width: float
+    positions: np.ndarray
+    neighbours: np.ndarray
+    elongation: ElongationSelection = field(default_factory=ElongationSelection)
+
+
 # Describe a selected output frame with either calibration data or an explicit failure.
 @dataclass
 class DiagnosticFrame:
@@ -243,6 +296,7 @@ class CatalogProvider:
 
 # Resolve the same default bright cut during CLI validation and provider construction.
 def catalog_bright_limit(catalog: str, band: str | None) -> float:
+    catalog = CATALOG_ALIASES.get(catalog.lower(), catalog.lower())
     # Keep CLI validation and provider selection on the same magnitude-default policy.
     if catalog == 'allwise':
         return ALLWISE_BRIGHT_LIMITS.get((band or 'W1').upper(), 8.)
@@ -546,7 +600,7 @@ class UCAC5(CatalogProvider):
 
 # Query Gaia-corrected PS1 mean positions with catalogue-specific reliability checks.
 class PanSTARRS1(CatalogProvider):
-    """Gaia EDR3-corrected PS1 DR2 single-epoch mean astrometry from MAST."""
+    """Gaia EDR3-corrected Pan-STARRS DR2 single-epoch mean astrometry from MAST."""
 
     PAGE_SIZE = 5000
     MAX_ROWS = 50000
@@ -586,7 +640,7 @@ class PanSTARRS1(CatalogProvider):
                   f'{self.band}MeanPSFMagErr', f'{self.band}QfPerfect',
                   f'{self.band}Flags'}
         records = []
-        print(f'  Querying PS1 DR2 mean ({self.min_mag:g} <= {self.band} '
+        print(f'  Querying Pan-STARRS DR2 mean ({self.min_mag:g} <= {self.band} '
               f'< {self.mag_limit:g}, radius {radius.to_value(u.arcmin):.1f} arcmin) ...',
               flush=True)
         for page in range(1, self.MAX_ROWS // self.PAGE_SIZE + 2):
@@ -595,17 +649,17 @@ class PanSTARRS1(CatalogProvider):
                                         timeout=(10, 60))
                 response.raise_for_status()
             except requests.RequestException as exc:
-                raise CatalogUnavailable(f'PS1 DR2 query failed: {exc}') from exc
+                raise CatalogUnavailable(f'Pan-STARRS DR2 query failed: {exc}') from exc
             reader = csv.DictReader(io.StringIO(response.text))
             if not needed.issubset(reader.fieldnames or ()):
                 missing = ', '.join(sorted(needed - set(reader.fieldnames or ())))
-                raise CatalogUnavailable(f'PS1 DR2 response lacks columns: {missing}')
+                raise CatalogUnavailable(f'Pan-STARRS DR2 response lacks columns: {missing}')
             rows = list(reader)
             records.extend({key: row[key] for key in needed} for row in rows)
             if len(rows) < self.PAGE_SIZE:
                 break
             if len(records) >= self.MAX_ROWS:
-                raise CatalogUnavailable('PS1 DR2 query exceeds 50,000 rows; '
+                raise CatalogUnavailable('Pan-STARRS DR2 query exceeds 50,000 rows; '
                                          'choose a narrower -m range or smaller field')
         return records
 
@@ -654,7 +708,7 @@ class PanSTARRS1(CatalogProvider):
                 continue
             good.append(row)
         if not good:
-            raise QACError(f'PS1 DR2 returned no usable corrected {self.band}-band mean stars')
+            raise QACError(f'Pan-STARRS DR2 returned no usable corrected {self.band}-band mean stars')
 
         ra = np.array([self._number(row, 'raMean') for row in good])
         dec = np.array([self._number(row, 'decMean') for row in good])
@@ -692,9 +746,9 @@ class PanSTARRS1(CatalogProvider):
                     current = old.apply_space_motion(new_obstime=obstime)
                 ra[reliable], dec[reliable] = current.ra.deg, current.dec.deg
                 sky = SkyCoord(ra*u.deg, dec*u.deg, frame='icrs')
-        print(f'  PS1 DR2: {len(records)} mean rows; {len(good)} usable Gaia EDR3-corrected '
+        print(f'  Pan-STARRS DR2: {len(records)} mean rows; {len(good)} usable Gaia EDR3-corrected '
               f'point sources; {moved} positions propagated to observation date', flush=True)
-        return ReferenceCatalog(sky, mag, f'PS1 DR2 ({self.band}, corrected mean)')
+        return ReferenceCatalog(sky, mag, f'Pan-STARRS DR2 ({self.band}, corrected mean)')
 
 
 # Query MAST's versioned Guide Star Catalog with its native stellar flag and magnitude.
@@ -890,7 +944,8 @@ def instrument_scale(hdul: fits.HDUList, frame: Frame, name: str) -> float:
             break
     if binning is None:
         factor = 1
-        print(f"  {name}: assuming standard binning ({preset.binning}x{preset.binning})", flush=True)
+        print(f"  {name}: Assuming camera binning {preset.binning}×{preset.binning} "
+              "for input image before applying binning", flush=True)
     else:
         try:
             bx, by = (int(value) for value in binning)
@@ -990,6 +1045,20 @@ def initial_wcs(hdul: fits.HDUList, frame: Frame, shape: tuple[int, int],
     return wcs, assumed_scale
 
 
+# Average complete blocks for source analysis, retaining the original top-left pixel origin.
+def prepare_detection_image(image: np.ndarray, factor: int = 1) -> np.ndarray:
+    if not isinstance(factor, (int, np.integer)) or isinstance(factor, (bool, np.bool_)) or factor < 1:
+        raise QACError('--binning must be a positive integer')
+    if factor == 1:
+        return image
+    # Exclude incomplete bottom/right blocks; invalid pixels invalidate their whole detection block.
+    height, width = image.shape[0]//factor, image.shape[1]//factor
+    if min(height, width) < 24:
+        raise QACError('--binning leaves fewer than 24 detection pixels along an image side')
+    blocks = image[:height*factor, :width*factor].reshape(height, factor, width, factor)
+    return blocks.mean(axis=(1, 3), dtype=float)
+
+
 # Subtract the local sky and estimate pixel noise for both detection and FWHM estimation.
 def source_image(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
     valid = np.isfinite(image)
@@ -997,7 +1066,7 @@ def source_image(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
         raise QACError("Image too small or contains too few finite pixels")
     # Use the same background model for the two source-analysis paths.
     try:
-        bkg = Background2D(image, box_size=min(64, max(16, min(image.shape)//4)),
+        bkg = Background2D(image, box_size=min(BACKGROUND_BOX_SIZE, max(16, min(image.shape)//4)),
                            filter_size=(3, 3), mask=~valid, bkg_estimator=MedianBackground())
         data = image - bkg.background
         _, _, sigma = sigma_clipped_stats(data[valid], sigma=3)
@@ -1009,38 +1078,273 @@ def source_image(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
     return np.where(valid, data, 0.0), valid, float(sigma)
 
 
-# Estimate a rough stellar FWHM from isolated, round, high-significance sources.
-def estimate_stellar_fwhm(image: np.ndarray) -> tuple[float, int]:
-    data, valid, sigma = source_image(image)
-    # Segment at a lower threshold than detection so stellar wings inform the moments.
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore', category=UserWarning)
-        segments = segment_sources(data, 3 * sigma, 7, mask=~valid)
+# Learn a robust elongation interval without treating population scatter as an error on the median.
+def automatic_elongation(values: np.ndarray) -> ElongationSelection:
+    values = np.asarray(values, float)
+    values = values[np.isfinite(values) & (values >= 1.)]
+    if len(values) < MIN_SHAPE_SOURCES:
+        raise InsufficientSources(f'Automatic elongation needs {MIN_SHAPE_SOURCES} suitable sources; found {len(values)}')
+    centre = float(np.median(values))
+    scatter = float(mad_std(values))
+    # A five-percent relative floor protects nearly identical moment shapes from a zero-width acceptance band.
+    tolerance = max(3*scatter, .05*centre)
+    return ElongationSelection(max(1., centre-tolerance), centre+tolerance, centre, scatter)
+
+
+# Apply one consistent brightness, area, shape, isolation and width selection to the FWHM candidate sample.
+def stellar_candidate_mask(analysis: SourceAnalysis) -> np.ndarray:
+    catalogue = analysis.catalogue
+    widths = np.asarray(catalogue.fwhm, float)
+    peaks = np.asarray(catalogue.max_value, float)
+    xy = analysis.positions
+    height, width = analysis.labels.shape
+    good = np.isfinite(widths) & np.isfinite(peaks)
+    good &= analysis.elongation.accepts(np.asarray(catalogue.elongation, float))
+    good &= (widths >= max(1., .5*analysis.coarse_width))
+    good &= (widths <= min(MAX_STAR_FWHM, min(height, width)/6, 2*analysis.coarse_width))
+    good &= (peaks >= 15*analysis.noise) & (analysis.neighbours > 2*widths)
+    good &= (xy[:, 0] > widths) & (xy[:, 0] < width-widths)
+    good &= (xy[:, 1] > widths) & (xy[:, 1] < height-widths)
+    return good & np.isin(catalogue.labels, analysis.eligible)
+
+
+# Segment once and select candidate areas from the rough stellar population, preserving every neighbour.
+def prepare_source_analysis(image: np.ndarray, elongation: float | None = DEFAULT_ELONGATION) -> SourceAnalysis:
+    if elongation is not None and (not np.isfinite(elongation) or elongation <= 1):
+        raise QACError('--elongation must exceed 1, or omit its value for automatic selection')
+    selection = ElongationSelection(maximum=np.inf if elongation is None else elongation)
+    data, valid, noise = source_image(image)
+    segments = segment_sources(data, 3*noise, 7, mask=~valid)
     if segments is None:
-        raise InsufficientSources('No suitable sources for stellar FWHM estimation')
+        raise InsufficientSources('No suitable segmented sources for stellar source analysis')
     catalogue = SourceCatalog(data, segments, mask=~valid)
-    xy = np.asarray(catalogue.centroid, dtype=float)
-    widths = np.asarray(catalogue.fwhm, dtype=float)
-    elongation = np.asarray(catalogue.elongation, dtype=float)
-    peaks = np.asarray(catalogue.max_value, dtype=float)
-    # Reject edge-truncated, elongated, faint, blended, and implausibly broad sources.
+    widths = np.asarray(catalogue.fwhm, float)
+    peaks = np.asarray(catalogue.max_value, float)
+    shapes = np.asarray(catalogue.elongation, float)
+    # Automatic mode admits all finite axis ratios at this stage, retaining brightness and size requirements.
+    bright = np.isfinite(widths) & (widths >= 1.) & (widths <= min(MAX_STAR_FWHM, min(image.shape)/6))
+    bright &= selection.accepts(shapes) & (peaks >= 15*noise)
+    samples = np.sort(widths[bright])
+    if len(samples):
+        # The densest factor-1.6 width interval reduces sensitivity to a few extended objects or defects.
+        ends = np.searchsorted(samples, samples*1.6, side='right')
+        start = int(np.argmax(ends-np.arange(len(samples))))
+        coarse = float(np.median(samples[start:ends[start]]))
+    else:
+        coarse = STAR_FWHM_FALLBACKS[0]
+    # Filter cached region areas; repeating identical thresholding would only remove the same small objects.
+    area = max(7, int(np.ceil(.05*coarse*coarse)))
+    eligible = segments.labels[segments.areas >= area]
+    xy = np.asarray(catalogue.centroid, float)
+    # Undefined centroids still contribute conservative neighbours through their geometric footprint centres.
+    if not np.isfinite(xy).all():
+        xy = xy.copy()
+        for index in np.flatnonzero(~np.isfinite(xy).all(axis=1)):
+            section = segments.slices[index]
+            pixels = np.argwhere(segments.data[section] == catalogue.labels[index])
+            xy[index] = pixels.mean(axis=0)[::-1]+[section[1].start, section[0].start]
     neighbours = cKDTree(xy).query(xy, k=2)[0][:, 1] if len(xy) > 1 else np.zeros(len(xy))
-    good = np.isfinite(widths) & np.isfinite(elongation) & np.isfinite(peaks)
-    good &= (widths >= 1.5) & (widths <= min(30, min(image.shape) / 6))
-    good &= (elongation < 1.3) & (peaks >= 15 * sigma) & (neighbours > 2 * widths)
-    good &= (xy[:, 0] > widths) & (xy[:, 0] < image.shape[1] - widths)
-    good &= (xy[:, 1] > widths) & (xy[:, 1] < image.shape[0] - widths)
-    selected = widths[good]
+    analysis = SourceAnalysis(data, valid, segments.data, noise, catalogue, eligible, area, coarse,
+                              xy, neighbours, selection)
+    # Learn the shape population before applying an elongation band; a sparse sample fails explicitly.
+    if elongation is None:
+        pool = stellar_candidate_mask(analysis)
+        analysis.elongation = automatic_elongation(shapes[pool])
+        selection = analysis.elongation
+        print(f'  Automatic elongation: median {selection.median:.3f}, robust scatter {selection.scatter:.3f}; '
+              f'accepting {selection.minimum:.3f} <= a/b < {selection.maximum:.3f} '
+              f'from {pool.sum()} suitable sources', flush=True)
+    elif elongation != DEFAULT_ELONGATION:
+        print(f'  Elongation selection: 1 <= a/b < {elongation:g}', flush=True)
+    print(f'  Stellar candidates: rough FWHM {coarse:.1f} working pixels; '
+          f'minimum region area {area} pixels; {len(eligible)} eligible regions', flush=True)
+    return analysis
+
+
+# Fit a local sky plane first, then a six-parameter elliptical Gaussian with an analytical Jacobian.
+def stellar_profile_fwhm(image: np.ndarray, labels: np.ndarray, label: int,
+                         position: np.ndarray, width: float, max_radius: float,
+                         fallback_noise: float, *, grow_cutout: bool = True,
+                         selection: ElongationSelection | None = None,
+                         covariance: np.ndarray | None = None) -> float | None:
+    selection = ElongationSelection() if selection is None else selection
+    extended_shape = selection.minimum != 1. or selection.maximum != DEFAULT_ELONGATION
+    radius = min(max(6, int(np.ceil(2*width))), int(max_radius))
+    x, y = np.rint(position).astype(int)
+    if radius < max(6, 1.4*width) or min(x-radius, y-radius) < 0 or (
+            x+radius >= image.shape[1] or y+radius >= image.shape[0]):
+        return None
+    # Mask other regions and invalid pixels, retaining sub-threshold stellar wings and surrounding sky.
+    cutout = image[y-radius:y+radius+1, x-radius:x+radius+1]
+    regions = labels[y-radius:y+radius+1, x-radius:x+radius+1]
+    yy, xx = np.mgrid[y-radius:y+radius+1, x-radius:x+radius+1].astype(float)
+    xx, yy = xx-position[0], yy-position[1]
+    valid = np.isfinite(cutout) & ((regions == 0) | (regions == label))
+    outer = valid & (np.hypot(xx, yy) >= 1.4*width)
+    if outer.sum() < 30 or valid.sum() < .8*cutout.size:
+        return None
+    # Two clipped linear solves remove the local sky slope without three extra nonlinear parameters.
+    design = np.column_stack((np.ones(outer.sum()), xx[outer]/radius, yy[outer]/radius))
+    sky_values = cutout[outer]
+    keep = np.ones(len(sky_values), bool)
+    try:
+        for _ in range(2):
+            plane = np.linalg.lstsq(design[keep], sky_values[keep], rcond=None)[0]
+            sky_residual = sky_values-design@plane
+            _, centre, local_noise = sigma_clipped_stats(sky_residual[keep], sigma=3)
+            if not np.isfinite(local_noise) or local_noise <= 0:
+                local_noise = fallback_noise
+            keep = np.abs(sky_residual-centre) <= 3*local_noise
+            if keep.sum() < 30:
+                return None
+    except np.linalg.LinAlgError:
+        return None
+    px, py = xx[valid], yy[valid]
+    values = cutout[valid]-(plane[0]+plane[1]*px/radius+plane[2]*py/radius)
+    amplitude = float(np.max(values))
+    if amplitude < 15*local_noise:
+        return None
+
+    # Evaluate the elliptical profile and its exact derivatives; no numerical derivative images are needed.
+    def model_and_jacobian(parameters):
+        peak, dx, dy, sx, sy, rho = parameters
+        a, b = (px-dx)/sx, (py-dy)/sy
+        q = 1-rho*rho
+        numerator = a*a+b*b-2*rho*a*b
+        profile = np.exp(-numerator/(2*q))
+        model = peak*profile
+        ax, by = (a-rho*b)/q, (b-rho*a)/q
+        jacobian = np.column_stack((profile, model*ax/sx, model*by/sy,
+                                    model*a*ax/sx, model*b*by/sy,
+                                    model*(a*b/q-rho*numerator/(q*q))))
+        return model, jacobian
+
+    # Share the last evaluation between the optimizer's residual and Jacobian calls.
+    previous, evaluated = None, None
+
+    # Cache only the current parameter vector; callers never modify the cached arrays.
+    def evaluate(parameters):
+        nonlocal previous, evaluated
+        if previous is None or not np.array_equal(previous, parameters):
+            previous = parameters.copy()
+            evaluated = model_and_jacobian(parameters)
+        return evaluated
+
+    # Normalize residuals by local scatter without interpreting it as an integrated stellar uncertainty.
+    def residual(parameters):
+        return (evaluate(parameters)[0]-values)/local_noise
+
+    # The exact Jacobian preserves the same parameter and residual conventions as the profile model.
+    def jacobian(parameters):
+        return evaluate(parameters)[1]/local_noise
+
+    # A broad computational guard bounds fitted sigmas; the measured population sets the narrower sample range.
+    sigma = width/GAUSSIAN_FWHM_FACTOR
+    maximum_sigma = min(MAX_STAR_FWHM, min(image.shape)/6)/GAUSSIAN_FWHM_FACTOR
+    if extended_shape:
+        maximum_sigma *= np.sqrt(2)
+    correlation_limit = .999999 if extended_shape else .5
+    initial = [amplitude, 0., 0., sigma, sigma, 0.]
+    lower = [0., -.5*width, -.5*width, .4, .4, -correlation_limit]
+    upper = [np.inf, .5*width, .5*width, maximum_sigma, maximum_sigma, correlation_limit]
+    # Moment covariance gives elongated, rotated profiles a suitable start without changing the default fit.
+    if (covariance is not None and np.isfinite(covariance).all() and
+            np.all(np.diag(covariance) > 0) and np.linalg.det(covariance) > 0):
+        sx, sy = np.sqrt(np.diag(covariance))
+        initial[3:6] = [np.clip(sx, .401, .999*maximum_sigma),
+                        np.clip(sy, .401, .999*maximum_sigma),
+                        np.clip(covariance[0, 1]/(sx*sy), -.999*correlation_limit, .999*correlation_limit)]
+    try:
+        fit = least_squares(residual, initial, jac=jacobian, bounds=(lower, upper),
+                            loss='soft_l1', max_nfev=60)
+    except (ValueError, np.linalg.LinAlgError):
+        return None
+    # Validate the fitted shape, centroid, contrast and core residuals independently of optimizer convergence.
+    peak, dx, dy, sx, sy, rho = fit.x
+    eigenvalues = np.linalg.eigvalsh([[sx*sx, rho*sx*sy], [rho*sx*sy, sy*sy]])
+    fitted_width = GAUSSIAN_FWHM_FACTOR*np.sqrt(np.mean(eigenvalues))
+    core = np.hypot(px-dx, py-dy) < fitted_width
+    if (not fit.success or not np.isfinite(fit.x).all() or eigenvalues[0] <= 0 or
+            np.any(fit.active_mask[3:5] != 0) or
+            not 1.5 <= fitted_width <= min(MAX_STAR_FWHM, min(image.shape)/6) or
+            not selection.accepts(np.sqrt(eigenvalues[1]/eigenvalues[0])) or
+            np.hypot(dx, dy) >= .45*width or peak < 5*local_noise or
+            not .7 < fitted_width/width < 2 or not core.any() or
+            np.median(np.abs(residual(fit.x)[core]))*local_noise > max(3*local_noise, .2*peak)):
+        return None
+    # Enlarge once after fitting when needed, respecting neighbours, edges and a valid-pixel area requirement.
+    if (grow_cutout and radius < 1.8*fitted_width and
+            min(int(max_radius), int(np.ceil(2*fitted_width))) > radius):
+        return stellar_profile_fwhm(image, labels, label, position, fitted_width, max_radius,
+                                    fallback_noise, grow_cutout=False, selection=selection,
+                                    covariance=np.array([[sx*sx, rho*sx*sy], [rho*sx*sy, sy*sy]])
+                                    if extended_shape else None)
+    if valid.sum() <= int(fitted_width+1)**2:
+        return None
+    return float(fitted_width)
+
+
+# Estimate stellar size through the same candidate selection and profile fitting on every working image.
+def estimate_stellar_fwhm(image: np.ndarray, *, analysis: SourceAnalysis | None = None) -> tuple[float, int]:
+    analysis = prepare_source_analysis(image) if analysis is None else analysis
+    catalogue = analysis.catalogue
+    xy = analysis.positions
+    widths = np.asarray(catalogue.fwhm, dtype=float)
+    peaks = np.asarray(catalogue.max_value, dtype=float)
+    neighbours = analysis.neighbours
+    good = stellar_candidate_mask(analysis)
+    # Keep the established bright-candidate cap and minimum twelve profiles; no repeated filtering is performed.
+    candidates = np.flatnonzero(good)
+    candidates = candidates[np.argsort(peaks[candidates])[::-1]][:80]
+    selected = []
+    for index in candidates:
+        # Default calls retain their existing signature; explicit shape modes reuse the measured covariance.
+        options = ({'selection': analysis.elongation,
+                    'covariance': np.asarray(catalogue.covariance[index], float)}
+                   if analysis.elongation.minimum != 1. or analysis.elongation.maximum != DEFAULT_ELONGATION else {})
+        fitted = stellar_profile_fwhm(image, analysis.labels, int(catalogue.labels[index]), xy[index],
+                                     widths[index], np.floor(neighbours[index]/2)-1, analysis.noise, **options)
+        if (fitted is not None and neighbours[index] > 2*fitted and
+                .5*analysis.coarse_width <= fitted <= 2*analysis.coarse_width):
+            selected.append(fitted)
     if len(selected) < 12:
         raise InsufficientSources(f'Only {len(selected)} suitable stars for stellar FWHM estimation; need at least 12')
     return float(np.median(selected)), len(selected)
 
 
+# Select brightness-ranked positions in balanced cell rounds, redistributing empty-cell quotas.
+def select_detection_indices(positions: np.ndarray, shape: tuple[int, int],
+                             limit: int, grid: int | None = None) -> np.ndarray:
+    # Preserve the original brightness ordering unless spatial selection was requested.
+    if grid is None:
+        return np.arange(min(limit, len(positions)))
+    cells = np.floor(positions / np.array([shape[1], shape[0]]) * grid).astype(int)
+    cells = np.clip(cells, 0, grid-1)
+    labels = cells[:, 1]*grid + cells[:, 0]
+    groups = [np.flatnonzero(labels == label) for label in np.unique(labels)]
+    # Within each round, brighter cell representatives come first; every prefix remains spatially balanced.
+    selected = []
+    for rank in range(max((len(group) for group in groups), default=0)):
+        selected.extend(sorted(int(group[rank]) for group in groups if rank < len(group)))
+        if len(selected) >= limit:
+            break
+    return np.asarray(selected[:limit], dtype=int)
+
+
 # Find star centroids using the supplied approximate stellar FWHM in pixels.
-def detect_sources(image: np.ndarray, fwhm: float = DEFAULT_STAR_FWHM) -> np.ndarray:
-    data, valid, sigma = source_image(image)
+def detect_sources(image: np.ndarray, fwhm: float = DEFAULT_STAR_FWHM, *,
+                   analysis: SourceAnalysis | None = None,
+                   max_detections: int = 200, grid: int | None = None) -> np.ndarray:
+    data, valid, sigma = (source_image(image) if analysis is None else
+                          (analysis.data, analysis.valid, analysis.noise))
+    # Explicit elongation modes replace DAO roundness gates with the shared measured axis-ratio selection.
+    shape_options = {}
+    if analysis is not None:
+        shape_options = ({'roundness_range': (-np.inf, np.inf)}
+                         if 'roundness_range' in inspect.signature(DAOStarFinder).parameters else
+                         {'roundlo': -np.inf, 'roundhi': np.inf})
     # Apply the existing DAO finder to the shared sky-subtracted image.
-    finder = DAOStarFinder(fwhm=fwhm, threshold=5*sigma, exclude_border=True)
+    finder = DAOStarFinder(fwhm=fwhm, threshold=5*sigma, exclude_border=True, **shape_options)
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', category=UserWarning)
         sources = finder(data)
@@ -1057,8 +1361,27 @@ def detect_sources(image: np.ndarray, fwhm: float = DEFAULT_STAR_FWHM) -> np.nda
     good &= (xy[:,1] > 6) & (xy[:,1] < image.shape[0]-7)
     finite = image[valid]
     good &= peak < np.percentile(finite, 99.99) * 1.1 if len(finite) > 10000 else True
+    if analysis is not None:
+        # Associate each DAO centre with its original segment, applying the same elongation band to detections.
+        indices = np.flatnonzero(good)
+        pixels = np.rint(xy[indices]).astype(int)
+        identities = analysis.labels[pixels[:, 1], pixels[:, 0]]
+        locations = np.searchsorted(analysis.catalogue.labels, identities)
+        shapes = np.asarray(analysis.catalogue.elongation, float)
+        accepted = (identities > 0) & analysis.elongation.accepts(shapes[np.minimum(locations, len(shapes)-1)])
+        good[indices] = accepted
+        # Long profiles can produce several DAO peaks; retain the centre nearest each region's moment centroid.
+        indices, identities, locations = indices[accepted], identities[accepted], locations[accepted]
+        distance = np.linalg.norm(xy[indices]-analysis.positions[locations], axis=1)
+        order = np.lexsort((-flux[indices], distance))
+        _, first = np.unique(identities[order], return_index=True)
+        good[:] = False
+        good[indices[order[first]]] = True
     # Count only usable centroids before deciding whether another FWHM guess may help.
-    selected = xy[good][np.argsort(flux[good])[::-1]][:200]
+    ordered = xy[good][np.argsort(flux[good])[::-1]]
+    # Keep the selected priority order: brightness by default, balanced cell rounds with --grid.
+    indices = select_detection_indices(ordered, image.shape, max_detections, grid)
+    selected = ordered[indices]
     if len(selected) < MIN_MATCHES:
         raise InsufficientSources(f'Only {len(selected)} usable sources detected; '
                                   f'need at least {MIN_MATCHES}')
@@ -2004,16 +2327,35 @@ def north_up_diagnostic(image: np.ndarray, source: WCS) -> tuple[np.ndarray, WCS
     return result, target
 
 
-# Measure the field centre and shorter angular side from opposite image-edge midpoints.
-def field_geometry(wcs: WCS, shape: tuple[int, int]) -> tuple[SkyCoord, u.Quantity]:
+# Measure the centre and width/height as great-circle separations between opposite edge midpoints.
+def field_extents(wcs: WCS, shape: tuple[int, int]) -> tuple[SkyCoord, u.Quantity]:
     height, width = shape
     x, y = (width-1)/2, (height-1)/2
     center = wcs.pixel_to_world(x, y)
     horizontal = wcs.pixel_to_world([-.5, width-.5], [y, y])
     vertical = wcs.pixel_to_world([x, x], [-.5, height-.5])
-    shorter_span = min(horizontal[0].separation(horizontal[1]),
-                       vertical[0].separation(vertical[1]))
-    return center, shorter_span.to(u.arcsec)
+    spans = u.Quantity([horizontal[0].separation(horizontal[1]),
+                        vertical[0].separation(vertical[1])]).to(u.arcsec)
+    return center, spans
+
+
+# Preserve the established shorter-side definition for pointing statistics and search windows.
+def field_geometry(wcs: WCS, shape: tuple[int, int]) -> tuple[SkyCoord, u.Quantity]:
+    center, spans = field_extents(wcs, shape)
+    return center, min(spans)
+
+
+# Share sexagesimal centre and adaptive angular-size formatting between terminal and every plot layout.
+def image_geometry_label(wcs: WCS, shape: tuple[int, int]) -> str:
+    center, spans = field_extents(wcs, shape)
+    ra = center.ra.to_string(unit=u.hourangle, sep=('h', 'm', 's'), precision=2, pad=True)
+    dec = center.dec.to_string(unit=u.deg, sep=('d', 'm', 's'), precision=1, pad=True, alwayssign=True)
+    # Choose units using unrounded sizes; mixed-size rectangles retain arcminutes.
+    arcmin = spans.to_value(u.arcmin)
+    unit = u.arcsec if max(arcmin) < 1 else (u.deg if min(arcmin) > 50 else u.arcmin)
+    width, height = spans.to_value(unit)
+    label = 'deg' if unit == u.deg else unit.to_string()
+    return f'Image Center: {ra}, {dec} | FOV: {width:.1f} x {height:.1f} {label}'
 
 
 # Reuse the same angular field definition for annotations and pointing-recovery displacements.
@@ -2075,10 +2417,10 @@ def draw_pointing_offset(field, wcs: WCS, shape: tuple[int, int], requested: Sky
 
     # Underline the offset label only above the declared 5% threshold; keep the key self-contained.
     lines = [f'Pointing offset: {separation:.1f}″', f'{100*fraction:.1f}% of shorter side']
-    fontsize = 8 if compact else 11
+    fontsize = PLOT_FONT_SIZES[0] if compact else PLOT_FONT_SIZES[1]
     label = TextArea('\n'.join(lines), textprops={'fontsize': fontsize, 'multialignment': 'right'})
     if fraction > POINTING_OFFSET_THRESHOLD:
-        font = FontProperties(size=fontsize)
+        font = FontProperties(family=PLOT_FONT_FAMILY, size=fontsize)
         length = max(TextPath((0, 0), line, prop=font).get_extents().width for line in lines)
         underline = DrawingArea(length, 2)
         line = Line2D([0, length], [1, 1], color=POINTING_COLOR, linewidth=2)
@@ -2115,18 +2457,14 @@ def draw_diagnostic_field(field, image: np.ndarray, display_wcs: WCS,
                           edgecolors='cyan', linewidths=1.0 if compact else 1.3,
                           label='Final fit matches', zorder=3)
     rings.set_path_effects([withStroke(linewidth=2.0 if compact else 2.8, foreground='#333333')])
-    # Source extraction already returns descending image flux; no second detection is needed.
-    brightest = display_xy[:10]
-    bright_rings = field.scatter(brightest[:, 0], brightest[:, 1], s=110 if compact else 240, facecolors='none',
-                                edgecolors='gold', linewidths=1.7 if compact else 2.4,
-                                label=f'{len(brightest)} brightest detected sources', zorder=4)
-    bright_rings.set_path_effects([withStroke(linewidth=2.7 if compact else 3.7, foreground='#333333')])
     field.set_xlim(-.5, width-.5)
     field.set_ylim(-.5, height-.5)
-    field.coords[0].set_axislabel('Right ascension', size=10 if compact else 14)
-    field.coords[1].set_axislabel('Declination', size=10 if compact else 14)
-    field.coords[0].set_ticklabel(size=9 if compact else 12)
-    field.coords[1].set_ticklabel(size=9 if compact else 12)
+    field.coords[0].set_axislabel('Right ascension', size=PLOT_FONT_SIZES[0] if compact else PLOT_FONT_SIZES[1],
+                                  fontfamily=PLOT_FONT_FAMILY)
+    field.coords[1].set_axislabel('Declination', size=PLOT_FONT_SIZES[0] if compact else PLOT_FONT_SIZES[1],
+                                  fontfamily=PLOT_FONT_FAMILY)
+    field.coords[0].set_ticklabel(size=PLOT_FONT_SIZES[0], fontfamily=PLOT_FONT_FAMILY)
+    field.coords[1].set_ticklabel(size=PLOT_FONT_SIZES[0], fontfamily=PLOT_FONT_FAMILY)
     if legend:
         field.legend(loc='upper left', facecolor='white', edgecolor='#555555',
                      labelcolor='black', fontsize=11, framealpha=.9)
@@ -2165,6 +2503,17 @@ def draw_diagnostic_field(field, image: np.ndarray, display_wcs: WCS,
                              measurement=pointing_measurement)
 
 
+# Apply the shared font policy to titles, axes, legends, tables and boxed annotations without global rc changes.
+def style_diagnostic_typography(figure) -> None:
+    from matplotlib.text import Text
+
+    # Ordinary axes and nested annotation text share this policy; WCS labels are configured at their renderer.
+    for text in figure.findobj(match=Text):
+        text.set_fontfamily(PLOT_FONT_FAMILY)
+        size = min(PLOT_FONT_SIZES, key=lambda candidate: abs(candidate-text.get_fontsize()))
+        text.set_fontsize(size)
+
+
 # Render calibrated pixels and accepted correspondences in a compact, readable layout.
 def diagnostic_figure(image: np.ndarray, display_wcs: WCS, solution: WCS,
                       data: FrameDiagnostics, *, title: str, instrument: str | None,
@@ -2188,18 +2537,25 @@ def diagnostic_figure(image: np.ndarray, display_wcs: WCS, solution: WCS,
     scale = float(np.sqrt(abs(np.linalg.det(display_wcs.pixel_scale_matrix))) * 3600)
     rms = float(np.sqrt(np.mean(radial**2)))
 
-    # Keep the field large and use the right column's full width for summary and graphs.
+    # Reserve a compact two-column header and give the wide field most of the remaining width.
     figure = Figure(figsize=(16, 9), facecolor='white')
     FigureCanvasAgg(figure)
-    grid = figure.add_gridspec(1, 2, width_ratios=(1.05, 1), left=.055, right=.975,
-                              bottom=.105, top=.88, wspace=.16)
-    quality = grid[0, 1].subgridspec(2, 2, height_ratios=(.82, 1), wspace=.34, hspace=.27)
-    field = figure.add_subplot(grid[0, 0], projection=display_wcs)
+    fields = figure.add_gridspec(1, 1, left=.085, right=.55, bottom=.105, top=.845)
+    # Restore the full-width statistics block above two adjacent quality graphs.
+    quality = figure.add_gridspec(2, 2, left=.565, right=.975, bottom=.105, top=.985,
+                                 height_ratios=(.82, 1), wspace=.5, hspace=.27)
+    field = figure.add_subplot(fields[0, 0], projection=display_wcs)
+    # Left-align aspect-constrained images and keep the entire field clear of the solution header.
+    field.set_anchor('W')
     summary = figure.add_subplot(quality[0, :])
     scatter = figure.add_subplot(quality[1, 0])
     vectors = figure.add_subplot(quality[1, 1])
-    figure.suptitle(f'QAC {VERSION} | Astrometric calibration', fontsize=20, y=.975)
-    figure.text(.5, .935, title, ha='center', fontsize=13)
+    figure.suptitle(f'QAC {VERSION} | Astrometric calibration', x=.055, ha='left',
+                    fontsize=PLOT_FONT_SIZES[1], y=.985)
+    figure.text(.055, .943, title, ha='left', fontsize=PLOT_FONT_SIZES[2])
+    # Report output-image geometry before any north-up diagnostic padding or rotation.
+    figure.text(.055, .905, image_geometry_label(*pointing_measurement),
+                ha='left', fontsize=PLOT_FONT_SIZES[1])
 
     # Reuse the same field renderer as the combined contact sheet.
     draw_diagnostic_field(field, image, display_wcs, display_xy, matches,
@@ -2223,7 +2579,7 @@ def diagnostic_figure(image: np.ndarray, display_wcs: WCS, solution: WCS,
              f'Observation (UTC): {observed}']
     summary.set_axis_off()
     summary.text(0, 1, '\n'.join(lines), transform=summary.transAxes,
-                 va='top', fontsize=13, linespacing=1.5)
+                 va='top', fontsize=PLOT_FONT_SIZES[1], linespacing=1.5)
 
     # Equal residual axes expose offsets, directional scatter, and individual outliers.
     scatter.scatter(east, north, s=25, color='#008c9c', alpha=.8, linewidths=0)
@@ -2254,7 +2610,7 @@ def diagnostic_figure(image: np.ndarray, display_wcs: WCS, solution: WCS,
     vectors.scatter(matched_xy[:, 0], matched_xy[:, 1], s=4, color='#555555')
     key = vectors.quiverkey(quiver, .08, .94, reference_length,
                             f'{reference_length:g} arcsec', labelpos='E',
-                            fontproperties={'size': 10})
+                            fontproperties={'size': PLOT_FONT_SIZES[0], 'family': PLOT_FONT_FAMILY})
     key.text.set_bbox({'facecolor': 'white', 'edgecolor': 'none', 'alpha': .9, 'pad': 2})
     vectors.set(xlim=(-.5, width-.5), ylim=(-.5, height-.5), xlabel='Output X (pixel)',
                 ylabel='Output Y (pixel)', title='Residual vectors (enlarged)')
@@ -2271,6 +2627,8 @@ def diagnostic_figure(image: np.ndarray, display_wcs: WCS, solution: WCS,
     # Explain the statistical scope and the reuse of validation stars in the final fit.
     figure.text(.5, .025, 'Fit residuals measure reference-catalogue agreement; '
                 'the final fit includes the validation stars.', ha='center', fontsize=12)
+    # Resolve every text role to the same three sizes before rendering or saving.
+    style_diagnostic_typography(figure)
     return figure
 
 
@@ -2333,7 +2691,7 @@ def combined_diagnostic_figure(frames: list[DiagnosticFrame], *, title: str,
     figure = Figure(figsize=size, facecolor='white')
     FigureCanvasAgg(figure)
     grid = figure.add_gridspec(1, 2, width_ratios=(ratio, 1), left=.045, right=.98,
-                              bottom=.095, top=.865, wspace=.12)
+                              bottom=.095, top=.845, wspace=.12)
     if merged_layout:
         fields = grid[0, 0].subgridspec(2, 4, wspace=.28, hspace=.27)
         slots = [fields[0, 0], fields[0, 1], fields[1, 0], fields[1, 1], fields[:, 2:]]
@@ -2346,13 +2704,14 @@ def combined_diagnostic_figure(frames: list[DiagnosticFrame], *, title: str,
         rows = (count+columns-1)//columns
         fields = grid[0, 0].subgridspec(rows, columns, wspace=.25, hspace=.27)
         slots = [fields[index//columns, index % columns] for index in range(count)]
-    quality = grid[0, 1].subgridspec(2, 2, height_ratios=(1.05, .95), wspace=.34, hspace=.16)
+    quality = grid[0, 1].subgridspec(2, 2, height_ratios=(.85, 1.15), wspace=.34, hspace=.22)
     successful = [item for item in frames if item.failure is None]
     failures = count-len(successful)
     status = 'PARTIAL SUCCESS: ' if failures and successful else ''
     figure.suptitle(f'QAC {VERSION} | {status}{len(successful)}/{count} frames solved',
-                    fontsize=20, y=.99, color='#a51d1d' if failures else 'black')
-    figure.text(.5, .945, title, ha='center', fontsize=13)
+                    x=.045, ha='left', fontsize=PLOT_FONT_SIZES[1], y=.995,
+                    color='#a51d1d' if failures else 'black')
+    figure.text(.045, .95, title, ha='left', fontsize=PLOT_FONT_SIZES[2])
 
     # Reuse calibrated field rendering, but give failed frames plain pixel axes and red borders.
     colors, residuals, scales, handles = [], [], [], []
@@ -2379,15 +2738,20 @@ def combined_diagnostic_figure(frames: list[DiagnosticFrame], *, title: str,
                 handles, _ = axis.get_legend_handles_labels()
             residuals.append(diagnostic_residuals(item.solution, item.data.sources, item.data.matches))
             scales.append(float(np.sqrt(abs(np.linalg.det(item.display_wcs.pixel_scale_matrix)))*3600))
-        axis.set_title(f'q{item.number} | {item.frame.label}', fontsize=11 if compact else 13,
+        # Attach each successful frame's own geometry rather than the padded north-up display footprint.
+        frame_title = f'q{item.number} | {item.frame.label}'
+        if item.failure is None:
+            frame_title += '\n'+image_geometry_label(item.display_wcs, item.image.shape).replace(' | ', '\n')
+        title_size = (8 if compact else 10) if item.failure is None else (11 if compact else 13)
+        axis.set_title(frame_title, fontsize=title_size,
                        color=color, weight='bold', pad=7)
 
     # Put the shared key into the narrow header strip, freeing every image tile for data.
-    labels = ['Final fit matches', 'Up to 10 brightest detections per frame'] if handles else []
+    labels = ['Final fit matches'] if handles else []
     if failures:
         handles.append(Patch(facecolor='none', edgecolor='#c62828', linewidth=2))
         labels.append('Failed frame (pixel axes)')
-    figure.legend(handles, labels, loc='upper left', bbox_to_anchor=(.045, .937),
+    figure.legend(handles, labels, loc='upper left', bbox_to_anchor=(.045, .925),
                    fontsize=10, ncol=len(labels), frameon=False)
 
     # Preserve failed rows without inventing counts, WCS scales, or low residual values.
@@ -2401,11 +2765,13 @@ def combined_diagnostic_figure(frames: list[DiagnosticFrame], *, title: str,
     times = list(dict.fromkeys(item.data.obstime.utc.isot[:19] if item.data.obstime is not None
                               else 'unavailable' for item in successful))
     observed = times[0] if len(times) == 1 else ('varies' if times else 'unavailable')
-    summary.text(0, 1, f'Reference: {", ".join(catalogs) or "unavailable"}\n'
+    # Move shared metadata above the table so its former space enlarges the quality graphs.
+    header_x = grid[0, 1].get_position(figure).x0
+    figure.text(header_x, .985, f'Reference: {", ".join(catalogs) or "unavailable"}\n'
                  f'Model: {", ".join(models) or "unavailable"} | Instrument: {instrument or "unspecified"}\n'
-                 f'Observation (UTC): {observed}\n'
-                 'RMS / Check / P90: arcsec; Check = held-out refit',
-                 va='top', fontsize=11.5, linespacing=1.4)
+                 f'Observation (UTC): {observed}', va='top', fontsize=PLOT_FONT_SIZES[1], linespacing=1.12)
+    summary.text(0, 1, 'RMS / Check / P90: arcsec; Check = held-out refit',
+                 va='top', fontsize=PLOT_FONT_SIZES[0])
     table_rows, fit_rms, check_rms = [], [], []
     for item, errors, scale in zip(frames, residuals, scales, strict=True):
         label = item.frame.name or (f'plane {item.frame.plane+1}' if item.frame.plane is not None else 'image')
@@ -2423,11 +2789,11 @@ def combined_diagnostic_figure(frames: list[DiagnosticFrame], *, title: str,
                            f'{len(radial)}/{len(item.data.sources)}/{item.data.reference_count}',
                            f'{rms:.3f}', f'{validation:.3f}' if validation is not None else '—',
                            f'{np.percentile(radial, 90):.3f}', f'{scale:.4f}'])
-    table_height = min(.62, .10*(count+1))
+    table_height = min(.86, .14*(count+1))
     table = summary.table(cellText=table_rows,
                           colLabels=['Frame', 'Fit/det/ref', 'RMS', 'Check', 'P90', '″/px'],
                           colWidths=[.24, .24, .13, .13, .12, .14], cellLoc='center',
-                          bbox=[0, .66-table_height, 1, table_height])
+                          bbox=[0, .90-table_height, 1, table_height])
     table.auto_set_font_size(False)
     table.set_fontsize(11.5)
     for (row, column), cell in table.get_celld().items():
@@ -2493,6 +2859,8 @@ def combined_diagnostic_figure(frames: list[DiagnosticFrame], *, title: str,
             'Validation stars are included in the final fits.')
     figure.text(.5, .025, 'Independent fits; residuals measure reference-catalogue agreement. '
                 + note, ha='center', fontsize=11)
+    # Keep multi-frame tables, failed-frame labels and coordinate titles on the same typography scale.
+    style_diagnostic_typography(figure)
     return figure
 
 
@@ -2624,29 +2992,71 @@ def bad_pointing_radius(windows: list[tuple[str, WCS]], shape: tuple[int, int],
     return radius
 
 
+# Fill omitted analysis settings from instrument defaults, preserving explicit values across frame solves.
+def apply_instrument_analysis(args: argparse.Namespace) -> None:
+    sifapsoft = getattr(args, 'instrument', None) == 'sifapsoft'
+    if not hasattr(args, 'binning'):
+        args.binning = 4 if sifapsoft else DEFAULT_DETECTION_BINNING
+    if not hasattr(args, 'elongation'):
+        args.elongation = None if sifapsoft else DEFAULT_ELONGATION
+
+
 # Solve and optionally resample one frame so expected failures can be isolated by the caller.
 def solve_frame(hdul: fits.HDUList, frame: Frame, args: argparse.Namespace,
                 coords: SkyCoord | None, provider: CatalogProvider
                 ) -> tuple[WCS, FrameDiagnostics | None, tuple[np.ndarray, WCS] | None]:
     print(f"Solving {frame.label} ...", flush=True)
+    apply_instrument_analysis(args)
+    # Explicit budgets replace catalogue heuristics; keep enough retained positions for shared refinement.
+    source_limit = getattr(args, 'number_detections', None)
+    if source_limit is None:
+        source_limit = 200 if isinstance(provider, (PanSTARRS1, AllWISE)) else 80
+    grid = getattr(args, 'grid', None)
+    detection_options = {}
+    if getattr(args, 'number_detections', None) is not None or grid is not None:
+        detection_options = dict(max_detections=max(200, source_limit), grid=grid)
+        print(f'  Initial matching detection budget: {source_limit}'
+              + (f'; spatial selection: {grid} x {grid} grid' if grid is not None else ''), flush=True)
     image = image_of(hdul, frame)
-    # Resolve the opt-in seed algorithm once; legacy programmatic callers retain pair matching.
-    match_method = getattr(args, 'match', 'pair')
-    if match_method not in MATCH_METHODS:
-        raise QACError(f'Unknown initial matching method: {match_method}')
-    if match_method != 'pair':
-        print(f'  Initial matching method: {match_method}', flush=True)
+    # Pool only source-analysis pixels; WCS geometry, fitting and output retain original image coordinates.
+    binning = getattr(args, 'binning', DEFAULT_DETECTION_BINNING)
+    detection_image = prepare_detection_image(image, binning)
+    if binning > 1:
+        print(f'  Detection binning {binning} x {binning} average: '
+              f'{detection_image.shape[1]} x {detection_image.shape[0]} pixels; '
+              'positions and FWHM reported in original pixels', flush=True)
+    # Auto exhausts the complete pair workflow before starting triangle; explicit internal methods stay independent.
+    requested_method = getattr(args, 'match', DEFAULT_MATCH_METHOD)
+    if requested_method not in (*MATCH_METHODS, 'auto'):
+        raise QACError(f'Unknown initial matching method: {requested_method}')
+    methods = ('pair', 'triangle') if requested_method == 'auto' else (requested_method,)
+    match_method = methods[0]
     scamp_config = (ScampConfig(max_sources=getattr(args, 'scamp_sources', None),
                                 max_references=getattr(args, 'scamp_references', None) or 180)
-                    if match_method == 'scamp' else None)
+                    if requested_method == 'scamp' else None)
     # Estimate by default, while retaining fixed guesses and an explicit legacy retry.
     selected_fwhm = getattr(args, 'fwhm', ESTIMATE_STAR_FWHM)
-    fwhm_trials = (DEFAULT_STAR_FWHM, 6.0)
+    # Explicit shape modes prepare one reusable map even when FWHM is fixed or its estimation is disabled.
+    elongation = getattr(args, 'elongation', DEFAULT_ELONGATION)
+    source_analysis = None
+    if elongation != DEFAULT_ELONGATION:
+        # An unavailable learned shape band must not prevent ordinary detection or FWHM retries.
+        try:
+            source_analysis = prepare_source_analysis(detection_image, elongation)
+        except InsufficientSources as exc:
+            if elongation is not None:
+                raise
+            print(f'  Automatic elongation unavailable ({exc}); using default shape handling '
+                  f'(FWHM sample elongation < {DEFAULT_ELONGATION:g}) ...', flush=True)
+    fwhm_trials = STAR_FWHM_FALLBACKS
     if selected_fwhm is ESTIMATE_STAR_FWHM:
         try:
-            estimated_fwhm, star_count = estimate_stellar_fwhm(image)
+            estimated_fwhm, star_count = (estimate_stellar_fwhm(detection_image) if source_analysis is None else
+                                          estimate_stellar_fwhm(detection_image, analysis=source_analysis))
+            estimated_fwhm *= binning
         except QACError as exc:
-            print(f'  Stellar FWHM estimation unavailable ({exc}); trying 3 then 6 pixels ...',
+            print(f'  Stellar FWHM estimation unavailable ({exc}); trying '
+                  f'{STAR_FWHM_FALLBACK_TEXT} pixels ...',
                   flush=True)
         else:
             print(f'  Estimated stellar FWHM {estimated_fwhm:.1f} pixels '
@@ -2658,14 +3068,20 @@ def solve_frame(hdul: fits.HDUList, frame: Frame, args: argparse.Namespace,
     source_cache: dict[float, np.ndarray] = {}
     detection_errors: dict[float, QACError] = {}
 
-    # Detect each stellar profile size at most once across catalogue-depth and radius retries.
+    # Cache each profile's positions and matching priority across catalogue, window and method retries.
     def sources_for(fwhm: float) -> np.ndarray:
         if fwhm in detection_errors:
             raise detection_errors[fwhm]
         if fwhm not in source_cache:
             try:
-                source_cache[fwhm] = (detect_sources(image) if fwhm == DEFAULT_STAR_FWHM
-                                      else detect_sources(image, fwhm))
+                width = fwhm/binning
+                detected = (detect_sources(detection_image, width, analysis=source_analysis, **detection_options)
+                            if source_analysis is not None else
+                            detect_sources(detection_image, **detection_options) if width == DEFAULT_STAR_FWHM else
+                            detect_sources(detection_image, width, **detection_options))
+                # Map reduced-pixel centres to original blocks without changing their cached grid priority.
+                source_cache[fwhm] = (detected if binning == 1 else
+                                      detected*binning+(binning-1)/2)
             except QACError as exc:
                 detection_errors[fwhm] = exc
                 raise
@@ -2742,7 +3158,7 @@ def solve_frame(hdul: fits.HDUList, frame: Frame, args: argparse.Namespace,
                 fitted, count, rms, mode = match_in_magnitude_order(
                     source, refxy, sky, image.shape, matching_wcs,
                     (0.5, 1.8) if assumed_scale else (0.75, 1.25), modes, distortion,
-                    200 if isinstance(provider, (PanSTARRS1, AllWISE)) else 80,
+                    source_limit,
                     diagnostics=details,
                     **({'match_method': match_method,
                         **({'scamp_config': scamp_config} if match_method == 'scamp' else {})}
@@ -2760,13 +3176,15 @@ def solve_frame(hdul: fits.HDUList, frame: Frame, args: argparse.Namespace,
             return fitted, count, rms, mode, len(refxy), details, source, fwhm
         raise QACError('Astrometric matching failed at all FWHM guesses: ' + '; '.join(failures))
 
-    # Cache each depth only in bad-pointing mode, retaining Gaia's depth/cap state alongside its rows.
+    # Share exact-cone/depth results across windows and auto methods, restoring Gaia depth/cap metadata on reuse.
     reference_cache = {}
+    cache_references = bad_pointing or requested_method == 'auto'
 
     # Query at the original centre even while the matching window moves; never crop cached rows per trial.
     def references_at(query_radius: u.Quantity, *, deep: bool = False) -> ReferenceCatalog:
-        if bad_pointing and deep in reference_cache:
-            reference, attributes = reference_cache[deep]
+        key = (float(query_radius.to_value(u.arcmin)), deep)
+        if cache_references and key in reference_cache:
+            reference, attributes = reference_cache[key]
         else:
             # Omit the deep keyword for providers that implement only the ordinary query interface.
             options = {'deep': True} if deep else {}
@@ -2775,14 +3193,14 @@ def solve_frame(hdul: fits.HDUList, frame: Frame, args: argparse.Namespace,
             except CatalogUnavailable:
                 raise
             except QACError as exc:
-                if not bad_pointing:
+                if not cache_references:
                     raise
                 reference = exc
-            if not bad_pointing:
+            if not cache_references:
                 return reference
             attributes = {name: getattr(provider, name) for name in ('last_upper', 'last_capped')
                           if hasattr(provider, name)}
-            reference_cache[deep] = reference, attributes
+            reference_cache[key] = reference, attributes
         for name, value in attributes.items():
             setattr(provider, name, value)
         if isinstance(reference, QACError):
@@ -2823,44 +3241,65 @@ def solve_frame(hdul: fits.HDUList, frame: Frame, args: argparse.Namespace,
             raise first_error
         return result, catalog
 
-    if bad_pointing:
-        # Exhaust ordinary depth/profile retries at each window and stop at the first validated solution.
-        failures = []
-        for label, initial in windows:
-            displacement = 'original centre' if label == 'original' else f'{label}, 50% of shorter field side'
-            print(f'  Bad-pointing trial: {displacement}; shared cone {radius.to_value(u.arcmin):.2f} arcmin ...',
-                  flush=True)
-            try:
-                result, catalog = solve_at(radius)
-            except CatalogUnavailable:
-                raise
-            except QACError as exc:
-                failures.append(f'{label}: {exc}')
-                print(f'  Bad-pointing trial {label} failed: {exc}', flush=True)
-                continue
-            print(f'  Bad-pointing solution accepted at {displacement}', flush=True)
-            break
-        else:
-            raise QACError('Original and all four shifted pointing windows failed: ' + '; '.join(failures))
-    else:
-        # Keep the historical instrument search and optional wider-radius retry unchanged without the flag.
+    # Restart each method from the original WCS; cached image detections and exact catalogue pools stay shared.
+    original_initial = initial.deepcopy()
+    method_failures = []
+    for method_index, match_method in enumerate(methods):
+        initial = original_initial.deepcopy()
+        print(f'  Initial matching method: {match_method}', flush=True)
         try:
-            result, catalog = solve_at(radius)
+            if bad_pointing:
+                # Exhaust ordinary depth/profile retries at each window and stop at the first validated solution.
+                failures = []
+                for label, initial in windows:
+                    displacement = 'original centre' if label == 'original' else f'{label}, 50% of shorter field side'
+                    print(f'  Bad-pointing trial: {displacement}; shared cone {radius.to_value(u.arcmin):.2f} arcmin ...',
+                          flush=True)
+                    try:
+                        result, catalog = solve_at(radius)
+                    except CatalogUnavailable:
+                        raise
+                    except QACError as exc:
+                        failures.append(f'{label}: {exc}')
+                        print(f'  Bad-pointing trial {label} failed: {exc}', flush=True)
+                        continue
+                    print(f'  Bad-pointing solution accepted at {displacement}', flush=True)
+                    break
+                else:
+                    raise QACError('Original and all four shifted pointing windows failed: ' + '; '.join(failures))
+            else:
+                # Keep the historical instrument search and optional wider-radius retry unchanged without the flag.
+                try:
+                    result, catalog = solve_at(radius)
+                except CatalogUnavailable:
+                    raise
+                except QACError as first_error:
+                    if not allow_wider_retry:
+                        raise
+                    print("  Retrying with a wider catalogue search ...", flush=True)
+                    try:
+                        result, catalog = solve_at(wide_radius)
+                    except CatalogUnavailable:
+                        raise
+                    except QACError as exc:
+                        raise QACError(f"Instrument search and wider retry failed: {first_error}; {exc}") from exc
         except CatalogUnavailable:
             raise
-        except QACError as first_error:
-            if not allow_wider_retry:
+        except QACError as exc:
+            if len(methods) == 1:
                 raise
-            print("  Retrying with a wider catalogue search ...", flush=True)
-            try:
-                result, catalog = solve_at(wide_radius)
-            except QACError as exc:
-                raise QACError(f"Instrument search and wider retry failed: {first_error}; {exc}") from exc
+            method_failures.append(f'{match_method}: {exc}')
+            if method_index+1 < len(methods):
+                print('  Pair workflow failed; trying triangle matching ...', flush=True)
+            continue
+        break
+    else:
+        raise QACError('All matching methods failed: ' + '; '.join(method_failures))
     fitted, count, rms, mode, reference_count, details, source, fwhm_used = result
     fitted_scale = np.sqrt(abs(np.linalg.det(fitted.pixel_scale_matrix))) * 3600
     print(f"  {len(source)} detected, {reference_count} {catalog.label} references; "
           f"{count} matches; RMS {rms:.3f} arcsec; scale {fitted_scale:.4f} arcsec/pixel; "
-          f"orientation {mode or 'normal'}; stellar FWHM guess {fwhm_used:g} pixels; WCS "
+          f"orientation {mode or 'normal'}; matcher {match_method}; stellar FWHM guess {fwhm_used:g} pixels; WCS "
           f"{'SIP ' + str(distortion) if distortion is not None else 'TAN'}")
     # Prepare output pixels here so a resampling failure affects only this frame.
     prepared = None
@@ -2870,6 +3309,9 @@ def solve_frame(hdul: fits.HDUList, frame: Frame, args: argparse.Namespace,
             prepared = resample_image(image_of(hdul, frame, dtype=None), fitted)
         except (QACError, ValueError, OSError) as exc:
             raise QACError(f'Resampling failed: {exc}') from exc
+    # Use the written output grid, including rectification when selected, for the shared geometry report.
+    output_wcs, output_shape = (prepared[1], prepared[0].shape) if prepared is not None else (fitted, image.shape)
+    print('  '+image_geometry_label(output_wcs, output_shape), flush=True)
     # Report explicit requested-to-solved separation even when PNG plotting was not requested.
     if coords is not None:
         _, separation, fraction = pointing_offset(prepared[1] if prepared is not None else fitted,
@@ -2889,7 +3331,7 @@ def solve(args: argparse.Namespace, *, status: SolveStatus | None = None) -> Pat
     if not path.is_file():
         raise QACError(f"Input file does not exist: {path}")
     coords = parse_coordinates(*args.coordinates) if args.coordinates else None
-    catalog_name = args.catalog.lower()
+    catalog_name = CATALOG_ALIASES.get(args.catalog.lower(), args.catalog.lower())
     band = args.band.upper() if args.band else None
     mag_min = (args.mag[0] if args.mag is not None and len(args.mag) == 2 else
                catalog_bright_limit(catalog_name, args.band))
@@ -2910,7 +3352,7 @@ def solve(args: argparse.Namespace, *, status: SolveStatus | None = None) -> Pat
     elif catalog_name == 'ps1':
         ps1_band = (args.band or 'r').lower()
         if ps1_band not in PS1_BANDS:
-            raise QACError("PS1 --band must be g, r, i, z, or y")
+            raise QACError("Pan-STARRS --band must be g, r, i, z, or y")
         provider = PanSTARRS1(band=ps1_band, min_mag=mag_min,
                               mag_limit=mag_max if mag_max is not None else PS1_DEFAULT_FAINT_MAG)
     elif catalog_name == 'allwise':
@@ -3084,7 +3526,7 @@ def main(argv: list[str] | None = None) -> int:
     for i, arg in enumerate(argv[:-2]):
         if arg in ('-c', '--coordinates') and argv[i+2].startswith('-') and ':' in argv[i+2]:
             argv[i+2] = 'QAC_NEG_DEC_' + argv[i+2][1:]
-    parser = argparse.ArgumentParser(description='Quick Gaia DR3, PS1 DR2, 2MASS, AllWISE, UCAC5, GSC 3.3, or local-catalogue astrometry for FITS images')
+    parser = argparse.ArgumentParser(description='Quick Gaia DR3, Pan-STARRS DR2, 2MASS, AllWISE, UCAC5, GSC 3.3, or local-catalogue astrometry for FITS images')
     parser.add_argument('image', help='FITS image or multi-frame file')
     parser.add_argument('-c', '--coordinates', nargs=2, metavar=('RA','DEC'), help='approximate field centre (degrees or RA hours:minutes:seconds, Dec degrees:minutes:seconds)')
     parser.add_argument('-ps', '--scale', '--pixel-scale', dest='scale',
@@ -3093,37 +3535,43 @@ def main(argv: list[str] | None = None) -> int:
     fwhm_group = parser.add_mutually_exclusive_group()
     fwhm_group.add_argument('--fwhm', nargs='?', default=ESTIMATE_STAR_FWHM,
                             const=ESTIMATE_STAR_FWHM, type=float, metavar='PIXELS',
-                            help='bare or omitted: estimate stellar FWHM, then fall back to 3/6 pixels; with PIXELS: fixed guess')
+                            help=f'bare or omitted: estimate stellar FWHM, then fall back to {STAR_FWHM_FALLBACK_TEXT} original-image pixels; with PIXELS: fixed guess')
     fwhm_group.add_argument('--nofwhm', dest='fwhm', action='store_const',
-                            const=None, help='skip image-based estimation; try 3 then 6 pixels')
+                            const=None, help=f'skip image-based estimation; try {STAR_FWHM_FALLBACK_TEXT} original-image pixels')
+    parser.add_argument('--binning', nargs='?', const=DEFAULT_DETECTION_BINNING, type=int,
+                        default=argparse.SUPPRESS, metavar='FACTOR',
+                        help='average blocks for source analysis (omitted/bare: 2); use 1 for native pixels; scale and FWHM stay in original pixels')
+    parser.add_argument('--elongation', nargs='?', const=None, type=float, default=argparse.SUPPRESS, metavar='MAX',
+                        help='maximum stellar axis ratio (default: 1.3); bare: learn a median/MAD band from bright isolated sources')
+    # Keep source-count and opt-in spatial selection controls beside source analysis.
+    parser.add_argument('-nd', '--number-detections', type=int, metavar='N',
+                        help='initial matching detection budget (at least 8); default 80, or 200 for Pan-STARRS/AllWISE; raises retained limit above 200 when needed')
+    parser.add_argument('--grid', nargs='?', const=3, type=int, metavar='N',
+                        help='select bright detections across N x N cells (2-19; bare: 3); applies through refinement; combination with --bad is not tested')
     parser.add_argument('-i', '--instrument', choices=tuple(INSTRUMENTS), type=str.lower,
-                        metavar='NAME', help='imaging preset: fors, mods, luci, hawki, bfosc, lbc, gmos, sifapsoft, nics; preset scale overrides header scales unless -ps is supplied; BFOSC defaults to Y flip')
+                        metavar='NAME', help='imaging preset: fors, mods, luci, hawki, bfosc, lbc, gmos, sifapsoft, nics; preset scale overrides header scales unless -ps is supplied; BFOSC defaults to Y flip; SIFAPSOFT defaults to analysis binning 4 and automatic elongation unless explicitly supplied')
     parser.add_argument('-q', '--cube', nargs='?', const='all', metavar='FRAME',
                         help='attempt all frames, retaining successes and marking failures; or select 1-based frame number / EXTNAME')
     parser.add_argument('-f', '--flip', nargs='?', const='auto', choices=('auto','x','y','xy'), metavar='X|Y|XY', help='try x, y, or xy flip; bare -f tries all orientations')
     parser.add_argument('-d', '--distortion', '--distorsion', dest='distortion', nargs='?',
                         const=2, type=int, choices=(2,3), metavar='2|3',
                         help='fit SIP distortion of degree 2 (bare -d) or 3; default linear TAN')
+    # Resampling uses the distortion fit, so keep these related controls adjacent.
+    parser.add_argument('--resample', action='store_true',
+                        help='rectify image pixels using SIP onto a plain TAN grid; implies -d 2')
     # Radius is in arcminutes; resampling retains only its long option.
     parser.add_argument('-r', '--radius', type=float, metavar='ARCMIN',
                         help='catalogue cone radius in arcmin; overrides automatic sizing and disables wider-radius retries (also filters local catalogues)')
     # Enable the tested shifted-window recovery only when explicitly requested.
     parser.add_argument('--bad-pointing', '--bad', dest='bad_pointing', action='store_true',
                         help='try the original window then N/E/S/W shifts of half the shorter field side; share one original-centred catalogue cone, respecting -r')
-    # Keep pair matching as the default while exposing triangle seeding as an independent alternative.
-    parser.add_argument('--match', choices=MATCH_METHODS, default='pair',
-                        help='initial star-pattern matcher: pair (default), triangle, or scamp (native pair-histogram FFT); fitting and validation are unchanged')
-    # Explicit SCAMP caps control pair-generation cost without changing default pair/triangle selection.
-    parser.add_argument('--scamp-sources', type=int, metavar='N',
-                        help='SCAMP detected-source seed cap (8..2000; default follows catalogue: 80 or 200)')
-    parser.add_argument('--scamp-references', type=int, metavar='N',
-                        help='SCAMP reference seed cap per magnitude group (8..2000; default 180)')
-    parser.add_argument('--resample', action='store_true',
-                        help='rectify image pixels using SIP onto a plain TAN grid; implies -d 2')
+    # Expose staged recovery and explicit production methods; SCAMP remains an internal experimental strategy.
+    parser.add_argument('--match', choices=CLI_MATCH_METHODS, default=DEFAULT_MATCH_METHOD,
+                        help='initial matcher: auto (default: complete pair workflow, then triangle on failure), pair, or triangle')
     parser.add_argument('-s', '--survey', '--catalog', dest='catalog', default='gaia',
                         metavar='SURVEY|FILE',
-                        help='reference source: gaia (Gaia DR3; default), ps1/ps, 2mass, allwise/aw, ucac5/uc, gsc3.3/gsc, or local RA DEC [MAG] text file')
-    parser.add_argument('-b', '--band', metavar='BAND', help='Gaia G/BP/RP (default RP), PS1 g/r/i/z/y (r), 2MASS J/H/Ks (J), AllWISE W1/W2/W3/W4 (W1), or UCAC5 G/R/J/H/Ks (G); GSC 3.3 uses mixed-band mag')
+                        help='reference source: gaia (Gaia DR3; default), pan-starrs (Pan-STARRS DR2; aliases ps and ps1), 2mass, allwise/aw, ucac5/uc, gsc3.3/gsc, or local RA DEC [MAG] text file')
+    parser.add_argument('-b', '--band', metavar='BAND', help='Gaia G/BP/RP (default RP), Pan-STARRS g/r/i/z/y (r), 2MASS J/H/Ks (J), AllWISE W1/W2/W3/W4 (W1), or UCAC5 G/R/J/H/Ks (G); GSC 3.3 uses mixed-band mag')
     parser.add_argument('-m', '--mag', type=float, nargs='+', metavar='MAG',
                         help='faint limit MAG with catalogue-specific bright cut, or explicit bright/faint range: -m 15 22')
     parser.add_argument('--refresh-catalog', action='store_true', help='query Gaia again instead of reading the local cache')
@@ -3133,14 +3581,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--overwrite', action='store_true', help='replace existing output file')
     parser.add_argument('-v', '--version', action='version', version=f'qac {VERSION}')
     args = parser.parse_args(argv)
+    # Suppressed parser defaults distinguish omission from explicit values, including bare optional flags.
+    apply_instrument_analysis(args)
     status = SolveStatus()
     try:
-        # Validate strategy-specific controls before opening an input or querying any provider.
-        if args.scamp_sources is not None or args.scamp_references is not None:
-            if args.match != 'scamp':
-                raise QACError('--scamp-sources and --scamp-references require --match scamp')
-            ScampConfig(max_sources=args.scamp_sources,
-                        max_references=args.scamp_references if args.scamp_references is not None else 180)
         # Resolve aliases before catalogue-specific magnitude defaults and provider selection.
         args.catalog = CATALOG_ALIASES.get(args.catalog.lower(), args.catalog)
         # Reject invalid cone sizes before reading images or querying catalogues.
@@ -3148,7 +3592,18 @@ def main(argv: list[str] | None = None) -> int:
             raise QACError("-r/--radius must be finite and positive (arcmin)")
         if args.scale is not None and (not np.isfinite(args.scale) or args.scale <= 0):
             raise QACError("-ps/--pixel-scale must be positive")
-        # Reject invalid stellar FWHM guesses before reading images or querying catalogues.
+        # Reject invalid detection binning and stellar FWHM guesses before image or catalogue access.
+        if args.binning < 1:
+            raise QACError('--binning must be a positive integer')
+        # Reject unusable budgets and grids before file access, and flag the untested combined workflow.
+        if args.number_detections is not None and args.number_detections < MIN_MATCHES:
+            raise QACError(f'--number-detections must be at least {MIN_MATCHES}')
+        if args.grid is not None and not 2 <= args.grid < 20:
+            raise QACError('--grid must be an integer from 2 to 19')
+        if args.grid is not None and args.bad_pointing:
+            print('WARNING: --BAD WITH --GRID: COMBINATION NOT TESTED.', file=sys.stderr, flush=True)
+        if args.elongation is not None and (not np.isfinite(args.elongation) or args.elongation <= 1):
+            raise QACError('--elongation must exceed 1, or omit its value for automatic selection')
         if args.fwhm is not None and args.fwhm is not ESTIMATE_STAR_FWHM and (
                 not np.isfinite(args.fwhm) or args.fwhm <= 0):
             raise QACError('--fwhm must be finite and positive (pixels)')
