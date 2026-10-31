@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""QAC: quick, catalogue-based astrometry for FITS images and image stacks.
+"""QUAC: quick, catalogue-based astrometry for FITS images and image stacks.
 
 Author: Andrea Rossi, with the assistance of ChatGPT.
 """
@@ -42,7 +42,7 @@ from photutils.detection import DAOStarFinder
 from photutils.segmentation import SourceCatalog, detect_sources as segment_sources
 
 # Release identity and catalogue/matching defaults.
-VERSION = "9.2.4"
+VERSION = "10.0.1"
 MIN_MATCHES = 8
 DEFAULT_STAR_FWHM = 3.0
 # CLI and programmatic frame solving share the same source-analysis binning default.
@@ -2030,11 +2030,11 @@ def write_wcs(header: fits.Header, wcs: WCS, *, resampled: bool = False) -> None
     if any(key in header for key in ('RA', 'DEC', 'OBJRA', 'OBJDEC')):
         header.add_history('Original pointing keywords retained; fitted sky WCS is in CRVAL1/2')
     if resampled:
-        header.add_history(f"QAC {VERSION}: image resampled to TAN with bilinear interpolation")
+        header.add_history(f"QUAC {VERSION}: image resampled to TAN with bilinear interpolation")
         header.add_history("Pixel-area correction applied; blank/outside pixels are NaN")
     else:
         model = f"SIP order {wcs.sip.a_order}" if wcs.sip is not None else "linear TAN"
-        header.add_history(f"QAC {VERSION}: {model} astrometry; pixels unchanged")
+        header.add_history(f"QUAC {VERSION}: {model} astrometry; pixels unchanged")
 
 
 def remove_wcs(header: fits.Header) -> None:
@@ -2113,7 +2113,7 @@ def write_frame_status(header: fits.Header, error: str | None, *, resampled: boo
         # FITS strings are ASCII; retain the complete readable reason using replacement characters.
         reason = ' '.join(error.split()).encode('ascii', errors='replace').decode('ascii')
         header['QACERR'] = reason
-        header.add_history(f'QAC {VERSION}: FAILED; input pixels and unverified WCS retained')
+        header.add_history(f'QUAC {VERSION}: FAILED; input pixels and unverified WCS retained')
 
 
 # Write successful calibrations and retain explicitly failed frames in their native pixels.
@@ -2550,7 +2550,7 @@ def diagnostic_figure(image: np.ndarray, display_wcs: WCS, solution: WCS,
     summary = figure.add_subplot(quality[0, :])
     scatter = figure.add_subplot(quality[1, 0])
     vectors = figure.add_subplot(quality[1, 1])
-    figure.suptitle(f'QAC {VERSION} | Astrometric calibration', x=.055, ha='left',
+    figure.suptitle(f'QUAC {VERSION} | Astrometric calibration', x=.055, ha='left',
                     fontsize=PLOT_FONT_SIZES[1], y=.985)
     figure.text(.055, .943, title, ha='left', fontsize=PLOT_FONT_SIZES[2])
     # Report output-image geometry before any north-up diagnostic padding or rotation.
@@ -2708,7 +2708,7 @@ def combined_diagnostic_figure(frames: list[DiagnosticFrame], *, title: str,
     successful = [item for item in frames if item.failure is None]
     failures = count-len(successful)
     status = 'PARTIAL SUCCESS: ' if failures and successful else ''
-    figure.suptitle(f'QAC {VERSION} | {status}{len(successful)}/{count} frames solved',
+    figure.suptitle(f'QUAC {VERSION} | {status}{len(successful)}/{count} frames solved',
                     x=.045, ha='left', fontsize=PLOT_FONT_SIZES[1], y=.995,
                     color='#a51d1d' if failures else 'black')
     figure.text(.045, .95, title, ha='left', fontsize=PLOT_FONT_SIZES[2])
@@ -3470,7 +3470,7 @@ def solve(args: argparse.Namespace, *, status: SolveStatus | None = None) -> Pat
                                     page_data, title=page_title, instrument=args.instrument)
                             try:
                                 figure.savefig(staged_outputs[plot_path], format='png', dpi=160,
-                                               metadata={'Software': f'QAC {VERSION}'})
+                                               metadata={'Software': f'QUAC {VERSION}'})
                             finally:
                                 figure.clear()
                         except (ImportError, OSError, ValueError, RuntimeError) as exc:
@@ -3579,7 +3579,7 @@ def main(argv: list[str] | None = None) -> int:
                         help='save diagnostic PNGs and try opening each in the system default viewer; long cubes use pages of up to six')
     parser.add_argument('-o', '--output', help='output FITS path (default: INPUT[_qN]_astro.fits, or INPUT[_qN]_resampled.fits with --resample)')
     parser.add_argument('--overwrite', action='store_true', help='replace existing output file')
-    parser.add_argument('-v', '--version', action='version', version=f'qac {VERSION}')
+    parser.add_argument('-v', '--version', action='version', version=f'quac {VERSION}')
     args = parser.parse_args(argv)
     # Suppressed parser defaults distinguish omission from explicit values, including bare optional flags.
     apply_instrument_analysis(args)
@@ -3617,7 +3617,7 @@ def main(argv: list[str] | None = None) -> int:
                                "use -m BRIGHT FAINT to change the bright limit")
         out = solve(args, status=status)
     except (QACError, ValueError, OSError) as exc:
-        parser.exit(2, f"qac: error: {exc}\n")
+        parser.exit(2, f"quac: error: {exc}\n")
     if status.failures:
         print(f'PARTIAL SUCCESS: {status.solved}/{status.selected} frames solved: {out}')
         return 1

@@ -1,4 +1,4 @@
-# QAC v9.2.4 — Quick Astrometry for FITS Images
+# QUAC v10.0.1 — Quick Astrometry for FITS Images
 
 <p align="center">
   <img src="images/example_badpointing.png" 
@@ -9,10 +9,12 @@
 </p>
 
 
+QUAC means Quick Astrometry for FITS images and Cubes.
+
 Author: Andrea Rossi, with the assistance of ChatGPT.  
 License: [MIT](LICENSE).
 
-QAC refines image astrometry against Gaia DR3, Pan-STARRS DR2 (PS1), 2MASS, AllWISE, UCAC5, GSC 3.3, or a local RA/Dec catalogue. Gaia DR3 remains the default. It writes a fitted TAN WCS, optionally with SIP distortion. The original pixels are retained unless `--resample` resamples them onto an undistorted TAN grid. Python 3.10+ is required.
+QUAC refines image astrometry against Gaia DR3, Pan-STARRS DR2 (PS1), 2MASS, AllWISE, UCAC5, GSC 3.3, or a local RA/Dec catalogue. Gaia DR3 remains the default. It writes a fitted TAN WCS, optionally with SIP distortion. The original pixels are retained unless `--resample` resamples them onto an undistorted TAN grid. Python 3.10+ is required.
 
 ## Install and run
 
@@ -20,29 +22,29 @@ Use Python 3.10+ with the requirements below. Set `RA` and `DEC` to your approxi
 
 ```bash
 python -m pip install -r requirements.txt
-python qac.py image.fits -c "$RA" "$DEC" -ps "$SCALE"
-python qac.py image.fits -c "$RA" "$DEC" -ps "$SCALE" --bad-pointing  # uncertain pointing
-python qac.py image.fits -c "$RA" "$DEC" -ps "$SCALE" -p  # FITS and diagnostic PNG
-python qac.py image.fits -c "$RA" "$DEC" -ps "$SCALE" --fwhm 7  # fixed stellar FWHM
-python qac.py image.fits -c "$RA" "$DEC" -ps "$SCALE" --nofwhm  # skip FWHM estimation
-python qac.py image.fits -c "$RA" "$DEC" -ps "$SCALE" --binning  # default 2 x 2 analysis
-python qac.py image.fits -c "$RA" "$DEC" -ps "$SCALE" --binning 1  # native-pixel analysis
-python qac.py image.fits -c "$RA" "$DEC" -ps "$SCALE" --elongation  # learn a typical shape and its spread
-python qac.py image.fits -c "$RA" "$DEC" -ps "$SCALE" --elongation 2.5  # explicit maximum axis ratio
+python quac.py image.fits -c "$RA" "$DEC" -ps "$SCALE"
+python quac.py image.fits -c "$RA" "$DEC" -ps "$SCALE" --bad-pointing  # uncertain pointing
+python quac.py image.fits -c "$RA" "$DEC" -ps "$SCALE" -p  # FITS and diagnostic PNG
+python quac.py image.fits -c "$RA" "$DEC" -ps "$SCALE" --fwhm 7  # fixed stellar FWHM
+python quac.py image.fits -c "$RA" "$DEC" -ps "$SCALE" --nofwhm  # skip FWHM estimation
+python quac.py image.fits -c "$RA" "$DEC" -ps "$SCALE" --binning  # default 2 x 2 analysis
+python quac.py image.fits -c "$RA" "$DEC" -ps "$SCALE" --binning 1  # native-pixel analysis
+python quac.py image.fits -c "$RA" "$DEC" -ps "$SCALE" --elongation  # learn a typical shape and its spread
+python quac.py image.fits -c "$RA" "$DEC" -ps "$SCALE" --elongation 2.5  # explicit maximum axis ratio
 ```
 
-Remote catalogues need internet access for uncached queries; local catalogues work offline. Run `python qac.py --help` for all options.
+Remote catalogues need internet access for uncached queries; local catalogues work offline. Run `python quac.py --help` for all options.
 
 `-p` enables diagnostic plotting. Supply pixel scale with `-ps`, `--pixel-scale`, or `--scale`; `-p` does not take a scale value.
 
 Terminal and plot reports show the solved image centre in HMS/DMS and field width × height to one decimal place. FOV uses arcseconds when both sides are below 1 arcmin, degrees when both exceed 50 arcmin, and arcminutes otherwise. Sizes span opposite image-edge midpoints before diagnostic rotation/padding; failed frames have no solved geometry report.
 
-Plots use DejaVu Sans at 9, 13 and 15 points. The filename is emphasized over the QAC heading; centre/FOV text uses the same size as the solution summary.
+Plots use DejaVu Sans at 9, 13 and 15 points. The filename is emphasized over the QUAC heading; centre/FOV text uses the same size as the solution summary.
 The header places image information on the left and solution metadata on the right. Single-frame plots use a wider field and vertically stacked residual graphs; multi-frame plots retain per-panel centre/FOV labels and the per-frame quality table.
 
-QAC uses the same stellar FWHM procedure on native and binned images. Background boxes target 256 working pixels, shrinking on small images. A single segmentation supplies region areas; a rough width population sets the minimum candidate area, while smaller regions remain possible neighbours. Isolated candidates receive an elliptical-Gaussian fit after a separate local sky-plane estimate, using an analytical Jacobian. Up to 80 bright candidates are fitted; at least 12 accepted profiles are required. Isolation is checked against both preliminary and fitted widths, and cutouts can enlarge once when necessary. The image-derived width range is bounded by a 100-working-pixel safety limit and image size. See [source analysis](SOURCE_ANALYSIS.md) for assumptions and safeguards.
+QUAC uses the same stellar FWHM procedure on native and binned images. Background boxes target 256 working pixels, shrinking on small images. A single segmentation supplies region areas; a rough width population sets the minimum candidate area, while smaller regions remain possible neighbours. Isolated candidates receive an elliptical-Gaussian fit after a separate local sky-plane estimate, using an analytical Jacobian. Up to 80 bright candidates are fitted; at least 12 accepted profiles are required. Isolation is checked against both preliminary and fitted widths, and cutouts can enlarge once when necessary. The image-derived width range is bounded by a 100-working-pixel safety limit and image size. See [source analysis](SOURCE_ANALYSIS.md) for assumptions and safeguards.
 
-This is an approximate Gaussian width, not a precision PSF/seeing measurement. Non-Gaussian profiles, correlated noise and unresolved blends can affect it. QAC tries 5 then 15 then 35 original-image pixels when estimation or matching fails. `--fwhm PIXELS` fixes the guess; `--nofwhm` skips estimation and tries 5 then 15 then 35. Bare `--fwhm` selects the default automatic mode and should follow the image path. Each guess is detected at most once per frame. Estimation requires no angular pixel scale and does not change orientation or catalogue radius.
+This is an approximate Gaussian width, not a precision PSF/seeing measurement. Non-Gaussian profiles, correlated noise and unresolved blends can affect it. QUAC tries 5 then 15 then 35 original-image pixels when estimation or matching fails. `--fwhm PIXELS` fixes the guess; `--nofwhm` skips estimation and tries 5 then 15 then 35. Bare `--fwhm` selects the default automatic mode and should follow the image path. Each guess is detected at most once per frame. Estimation requires no angular pixel scale and does not change orientation or catalogue radius.
 
 `--binning [FACTOR]` averages complete square blocks for source analysis. Omitted or bare selects **2**; `--binning 1` uses native pixels, and larger factors are available for oversampled images. Positions are mapped back to original pixel centres; `-ps`, explicit `--fwhm`, reported FWHM and WCS remain in original-image units. The original FITS pixels are retained unless `--resample` is selected. Incomplete bottom/right blocks are excluded from detection, and a block containing non-finite pixels remains invalid. At least 24 reduced pixels per side are required. Averaging can blend close stars or undersample narrow profiles; use 1 for those cases.
 
@@ -50,38 +52,38 @@ This is an approximate Gaussian width, not a precision PSF/seeing measurement. N
 
 `--grid [N]` selects bright detections across **N×N** source-analysis image cells (2–19; bare: **3×3**). Each round takes the brightest remaining star per occupied cell, redistributing unused places from sparse cells. Selection and ordering are cached per FWHM and preserved when mapping binned positions to original pixels; matching, refinement and plots reuse this sample. This can improve spatial coverage for distortion fitting, but cannot fill empty cells or guarantee a reliable distortion model. It is opt-in and does not change catalogue windows. Combining it with `--bad` is allowed but prints **WARNING: COMBINATION NOT TESTED**.
 
-Elongation is the major/minor axis ratio. The default FWHM sample retains the **1.3** cutoff. `--elongation MAX` sets a finite maximum greater than 1. Bare `--elongation` learns a median and MAD-based spread from at least 12 bright, isolated, size-consistent candidates without an initial fixed elongation ceiling. Its acceptance band is the median ± `max(3 × robust_scatter, 0.05 × median)`, clipped at 1. This is an empirical shape-consistency filter, not proof of stellar identity or a formal confidence interval. Nondefault numeric and automatic modes also filter DAO detections by measured axis ratio, replacing DAO's roundness gates; other detection and fit-quality checks remain. Bare options should follow the input image. Shape learning still runs with fixed `--fwhm` or `--nofwhm`. If too few suitable candidates are available, QAC reports this and continues with default shape handling and normal FWHM retries.
+Elongation is the major/minor axis ratio. The default FWHM sample retains the **1.3** cutoff. `--elongation MAX` sets a finite maximum greater than 1. Bare `--elongation` learns a median and MAD-based spread from at least 12 bright, isolated, size-consistent candidates without an initial fixed elongation ceiling. Its acceptance band is the median ± `max(3 × robust_scatter, 0.05 × median)`, clipped at 1. This is an empirical shape-consistency filter, not proof of stellar identity or a formal confidence interval. Nondefault numeric and automatic modes also filter DAO detections by measured axis ratio, replacing DAO's roundness gates; other detection and fit-quality checks remain. Bare options should follow the input image. Shape learning still runs with fixed `--fwhm` or `--nofwhm`. If too few suitable candidates are available, QUAC reports this and continues with default shape handling and normal FWHM retries.
 
 ## Examples
 
 ```bash
-python qac.py image.fits                                 # header position and scale
-python qac.py image.fits -i mods -c "$RA" "$DEC"         # instrument preset
-python qac.py image.fits -i bfosc -c "$RA" "$DEC"        # BFOSC preset and virtual Y flip
-python qac.py image.fits --bad                           # shifted-window recovery
-python qac.py image.fits --match triangle                # alternative initial matcher
-python qac.py image.fits --match pair                    # pair only, without triangle fallback
-python qac.py image.fits --catalog stars.txt             # local RA/Dec catalogue
-python qac.py image.fits --catalog gaia -b G -m 15 19    # 15 <= G < 19
-python qac.py image.fits --catalog pan-starrs -b r -m 15 22     # Pan-STARRS mean catalogue
-python qac.py image.fits --catalog 2mass -b Ks -m 10 14  # 10 <= Ks < 14
-python qac.py image.fits -s aw -b W1 -m 8 16             # AllWISE
-python qac.py image.fits -s uc -b G -m 8 16              # UCAC5
-python qac.py image.fits -s gsc -m 12 20                 # GSC 3.3
-python qac.py image.fits -f                              # try all virtual flips
-python qac.py image.fits -f x -d 3                       # X flip and degree-3 SIP
-python qac.py image.fits --resample                      # degree-2 SIP and rectified TAN pixels
-python qac.py multi.fits -q -p                           # all frames and diagnostic pages
-python qac.py multi.fits -q 5                            # only image frame 5
-python qac.py multi.fits -q SCI                          # unique SCI extension
-python qac.py multi.fits -i mods -q MERGED               # explicit MERGED selection
+python quac.py image.fits                                 # header position and scale
+python quac.py image.fits -i mods -c "$RA" "$DEC"         # instrument preset
+python quac.py image.fits -i bfosc -c "$RA" "$DEC"        # BFOSC preset and virtual Y flip
+python quac.py image.fits --bad                           # shifted-window recovery
+python quac.py image.fits --match triangle                # alternative initial matcher
+python quac.py image.fits --match pair                    # pair only, without triangle fallback
+python quac.py image.fits --catalog stars.txt             # local RA/Dec catalogue
+python quac.py image.fits --catalog gaia -b G -m 15 19    # 15 <= G < 19
+python quac.py image.fits --catalog pan-starrs -b r -m 15 22     # Pan-STARRS mean catalogue
+python quac.py image.fits --catalog 2mass -b Ks -m 10 14  # 10 <= Ks < 14
+python quac.py image.fits -s aw -b W1 -m 8 16             # AllWISE
+python quac.py image.fits -s uc -b G -m 8 16              # UCAC5
+python quac.py image.fits -s gsc -m 12 20                 # GSC 3.3
+python quac.py image.fits -f                              # try all virtual flips
+python quac.py image.fits -f x -d 3                       # X flip and degree-3 SIP
+python quac.py image.fits --resample                      # degree-2 SIP and rectified TAN pixels
+python quac.py multi.fits -q -p                           # all frames and diagnostic pages
+python quac.py multi.fits -q 5                            # only image frame 5
+python quac.py multi.fits -q SCI                          # unique SCI extension
+python quac.py multi.fits -i mods -q MERGED               # explicit MERGED selection
 ```
 
 ## Position, scale, and catalogue
 
 `-r/--radius ARCMIN` sets a finite, positive catalogue cone radius in arcminutes around the initial field centre for each selected frame. It overrides automatic radius sizing, including instrument presets, and disables wider-radius retries. In normal mode, automatic sizing and retries retain their established behavior. It applies to Gaia, Pan-STARRS, 2MASS, AllWISE, UCAC5, GSC 3.3, and spatial filtering of local catalogues. Magnitude-depth retries may still occur within the same radius; existing catalogue row limits and cache behavior still apply.
 
-For example, `python qac.py image.fits -r 5` requests a 5-arcmin radius.
+For example, `python quac.py image.fits -r 5` requests a 5-arcmin radius.
 
 `--bad-pointing` (alias `--bad`) tries the original centre, then north, east, south, and west centres displaced by **50% of the shorter field side**, stopping at the first accepted solution. Each trial uses the normal window: the image footprint plus **30% of the longer field side beyond every edge**. A 5′ square image therefore uses 8′ square windows. The mode is off by default and supports every catalogue provider.
 
@@ -95,7 +97,7 @@ Pointing reports and annotations retain the original explicit `-c` coordinates. 
 
 SCAMP is retained internally for research, tests and independent comparisons, but `--match scamp`, `--scamp-sources` and `--scamp-references` are disabled. Its [method and benchmark records](SCAMP_MATCHING.md) remain available.
 
-`-c/--coordinates RA DEC` overrides the approximate field centre. Plain numbers are degrees; sexagesimal RA uses hours and Dec uses degrees. `-ps/--pixel-scale` (also `--scale`) is the initial scale in arcseconds per pixel. Matching refines this scale. Without `-ps` or an instrument preset, a header WCS or `PIXSCALE`/`SECPIX` can supply it; otherwise QAC assumes **0.2 arcsec/pixel**, prints a prominent warning, and searches a wider scale range. Give `-ps` when you know the scale. An approximate centre is always needed.
+`-c/--coordinates RA DEC` overrides the approximate field centre. Plain numbers are degrees; sexagesimal RA uses hours and Dec uses degrees. `-ps/--pixel-scale` (also `--scale`) is the initial scale in arcseconds per pixel. Matching refines this scale. Without `-ps` or an instrument preset, a header WCS or `PIXSCALE`/`SECPIX` can supply it; otherwise QUAC assumes **0.2 arcsec/pixel**, prints a prominent warning, and searches a wider scale range. Give `-ps` when you know the scale. An approximate centre is always needed.
 
 `-i/--instrument NAME` selects an initial scale and field-size check:
 
@@ -119,7 +121,7 @@ Recorded binning adjusts preset scales relative to the reference binning in the 
 
 The preset values are based on the [ESO FORS2](https://ftp.eso.org/pub/dfs/pipelines/instruments/fors/fors-img-reflex-tutorial-2.0.pdf), [LBTO MODS](https://scienceops.lbto.org/mods/) / [LUCI](https://www.lbto.org/instruments-overview/), [ESO HAWK-I](https://eso.org/sci/facilities/paranal/instruments/hawki.html), [LBC](https://www.lbto.org/instruments-overview/), [Gemini GMOS](https://www2.gemini.edu/instrumentation/gmos/observation-preparation), and [BFOSC](https://www.oas.inaf.it/wp-content/uploads/2019/05/BFOSC_en_UM_2001.pdf) documentation. SIFAPSOFT and NICS use the scale and approximate field sizes supplied for this release. BFOSC's manual quotes 0.58″/pixel; the preset uses the requested 0.57″/pixel. The MODS preset uses one value for both channels.
 
-When a valid input WCS and header pointing (`RA`/`DEC` or `OBJRA`/`OBJDEC`) disagree by more than 1 arcmin or a quarter of the image's half-diagonal, QAC warns with the separation. It still starts from the input WCS; use `-c RA DEC` to override its centre. Linear TAN solutions also report a held-out RMS: QAC refits using 80% of the matched stars, checks predictions for the other 20%, and rejects a solution whose held-out error is too large. SIP fits retain their separate held-out validation.
+When a valid input WCS and header pointing (`RA`/`DEC` or `OBJRA`/`OBJDEC`) disagree by more than 1 arcmin or a quarter of the image's half-diagonal, QUAC warns with the separation. It still starts from the input WCS; use `-c RA DEC` to override its centre. Linear TAN solutions also report a held-out RMS: QUAC refits using 80% of the matched stars, checks predictions for the other 20%, and rejects a solution whose held-out error is too large. SIP fits retain their separate held-out validation.
 
 For LBC, each CCD covers about 7.8′ × 17.6′. Use the same preset for one CCD or the full camera: the image dimensions, not the nominal field in the table, determine the catalogue search. Select a CCD in a multi-extension file with `-q N` or `-q EXTNAME`. For GMOS, 1×1 binning gives a starting scale of 0.080″/pixel when recorded in the header. Use a processed GMOS image or mosaic; raw amplifier extensions contain overscan and are not independent sky frames.
 
@@ -129,19 +131,19 @@ The default catalogue is Gaia DR3 in RP with **12 ≤ RP < 20**. `-s/--survey` (
 
 AllWISE `-b` accepts W1/W2/W3/W4, with default ranges of 8–16, 7–15, 4–11, and 0–8 respectively. UCAC5 `-b` accepts G/R/J/H/Ks; its default bright limit is 8 in all bands, with faint limits of 16, 16, 15.8, 15.1, and 14.3. Gaia G/BP/RP, Pan-STARRS g/r/i/z/y, and 2MASS J/H/Ks band selection is unchanged; `K` is also accepted for `Ks`.
 
-AllWISE queries [VizieR II/328/allwise](https://cdsarc.cds.unistra.fr/viz-bin/ReadMe/II/328?format=html&tex=true). It uses the recommended stationary `RAJ2000`/`DEJ2000` positions, not the motion-fit positions. Astrometric references require quality A in W1 and the selected band, no flagged artifacts or saturated pixels in those bands, no extended-source flag, one fitted component, no active deblending, and a finite error-ellipse semi-major axis of at most 0.3 arcsec. The [AllWISE apparent motions mix proper motion and parallax](https://irsa.ipac.caltech.edu/data/WISE/docs/release/AllWISE/expsup/sec2_1.html), so QAC does not propagate them to the observing date. Optical/infrared source differences, blending, and uncorrected stellar motion can limit agreement with an optical image.
+AllWISE queries [VizieR II/328/allwise](https://cdsarc.cds.unistra.fr/viz-bin/ReadMe/II/328?format=html&tex=true). It uses the recommended stationary `RAJ2000`/`DEJ2000` positions, not the motion-fit positions. Astrometric references require quality A in W1 and the selected band, no flagged artifacts or saturated pixels in those bands, no extended-source flag, one fitted component, no active deblending, and a finite error-ellipse semi-major axis of at most 0.3 arcsec. The [AllWISE apparent motions mix proper motion and parallax](https://irsa.ipac.caltech.edu/data/WISE/docs/release/AllWISE/expsup/sec2_1.html), so QUAC does not propagate them to the observing date. Optical/infrared source differences, blending, and uncorrected stellar motion can limit agreement with an optical image.
 
-UCAC5 queries [VizieR I/340/ucac5](https://cdsarc.cds.unistra.fr/viz-bin/ReadMe/I/340?format=html&tex=true), using its Gaia DR1 `RAgaia`/`DEgaia` positions at J2015.0 and `pmRA`/`pmDE` in mas/year (`pmRA` includes cos(Dec)). These differ from the older UCAC-epoch positions. With `DATE-OBS` or `MJD-OBS`, QAC propagates usable proper motions and rejects rows with missing motions. Without a date it keeps J2015.0 positions and prints a warning. Formal Gaia coordinate errors must be finite and at most 300 mas per axis; proper-motion errors must be finite and at most 10 mas/year per axis. Missing-photometry placeholders 0 and 30 in R/J/H/Ks are rejected. These are quality cuts, not a full propagated covariance or fit weights; parallax and unmodeled systematics remain limitations.
+UCAC5 queries [VizieR I/340/ucac5](https://cdsarc.cds.unistra.fr/viz-bin/ReadMe/I/340?format=html&tex=true), using its Gaia DR1 `RAgaia`/`DEgaia` positions at J2015.0 and `pmRA`/`pmDE` in mas/year (`pmRA` includes cos(Dec)). These differ from the older UCAC-epoch positions. With `DATE-OBS` or `MJD-OBS`, QUAC propagates usable proper motions and rejects rows with missing motions. Without a date it keeps J2015.0 positions and prints a warning. Formal Gaia coordinate errors must be finite and at most 300 mas per axis; proper-motion errors must be finite and at most 10 mas/year per axis. Missing-photometry placeholders 0 and 30 in R/J/H/Ks are rejected. These are quality cuts, not a full propagated covariance or fit weights; parallax and unmodeled systematics remain limitations.
 
-GSC 3.3 queries the [MAST Guide Star Catalog service](https://outerspace.stsci.edu/spaces/MASTDATA/pages/176435487/Catalog+Access) with `CATALOG=GSC33` and accepts only rows classified as stars (`classification=0`) with finite coordinates and `mag`. The default cut is **12 ≤ mag < 20**; `-m` changes it. The service's `mag` is a preferred magnitude from potentially different passbands, so brightness ordering and cuts are approximate across sources; `-b` is unavailable. When an observation date exists, QAC requests coordinates at that epoch from MAST. QAC requests GSC33 explicitly, checks the CSV count and columns, and rejects responses that name a different GSC release. Queries reaching the 10,000-row cap are rejected; use `-m` or `-r` to narrow them.
+GSC 3.3 queries the [MAST Guide Star Catalog service](https://outerspace.stsci.edu/spaces/MASTDATA/pages/176435487/Catalog+Access) with `CATALOG=GSC33` and accepts only rows classified as stars (`classification=0`) with finite coordinates and `mag`. The default cut is **12 ≤ mag < 20**; `-m` changes it. The service's `mag` is a preferred magnitude from potentially different passbands, so brightness ordering and cuts are approximate across sources; `-b` is unavailable. When an observation date exists, QUAC requests coordinates at that epoch from MAST. QUAC requests GSC33 explicitly, checks the CSV count and columns, and rejects responses that name a different GSC release. Queries reaching the 10,000-row cap are rejected; use `-m` or `-r` to narrow them.
 
 AllWISE, UCAC5, and 2MASS share VizieR transport and reject responses reaching the 10,000-row limit. Narrow `-m` or `-r` for dense fields. Cone searches select sources at their catalogue positions before any epoch propagation; very high proper-motion sources can cross a cone boundary between epochs.
 
-Pan-STARRS queries the [MAST DR2 mean catalogue](https://catalogs.mast.stsci.edu/docs/panstarrs.html) using `raMean`/`decMean` positions corrected against [Gaia EDR3](https://archive.stsci.edu/contents/newsletters/july-2022/updated-astrometry-for-the-pan-starrs1-catalog). It accepts sources with the corrected-astrometry flag, at least three detections, the GOOD quality bit and no extended-source bit, band coverage, and suitable photometric and positional errors. The current limits are band `QfPerfect ≥ 0.85`, mean PSF magnitude error ≤ 0.3 mag, and each mean coordinate error ≤ 0.3 arcsec. With `DATE-OBS` or `MJD-OBS`, reliable [Pan-STARRS proper motions](https://outerspace.stsci.edu/spaces/PANSTARRS/pages/298812412/PS1%2BObjectThin%2Btable%2Bfields) are propagated from `epochMean` (MJD); `pmra` and `pmdec` are in mas/year, with `pmra` interpreted as μRA cos(Dec). QAC requires the PM flag, no bad-PM flag, errors ≤ 2 mas/year on each axis, and propagation uncertainty ≤ 0.1 arcsec. Sources lacking a usable motion or observation date retain `raMean`/`decMean`.
+Pan-STARRS queries the [MAST DR2 mean catalogue](https://catalogs.mast.stsci.edu/docs/panstarrs.html) using `raMean`/`decMean` positions corrected against [Gaia EDR3](https://archive.stsci.edu/contents/newsletters/july-2022/updated-astrometry-for-the-pan-starrs1-catalog). It accepts sources with the corrected-astrometry flag, at least three detections, the GOOD quality bit and no extended-source bit, band coverage, and suitable photometric and positional errors. The current limits are band `QfPerfect ≥ 0.85`, mean PSF magnitude error ≤ 0.3 mag, and each mean coordinate error ≤ 0.3 arcsec. With `DATE-OBS` or `MJD-OBS`, reliable [Pan-STARRS proper motions](https://outerspace.stsci.edu/spaces/PANSTARRS/pages/298812412/PS1%2BObjectThin%2Btable%2Bfields) are propagated from `epochMean` (MJD); `pmra` and `pmdec` are in mas/year, with `pmra` interpreted as μRA cos(Dec). QUAC requires the PM flag, no bad-PM flag, errors ≤ 2 mas/year on each axis, and propagation uncertainty ≤ 0.1 arcsec. Sources lacking a usable motion or observation date retain `raMean`/`decMean`.
 
-At r≈22, some Pan-STARRS detections exist only in the [stack catalogue](https://catalogs.mast.stsci.edu/docs/panstarrs.html). Their `raStack`/`decStack` positions do not have the same Gaia EDR3 correction and can have larger systematic errors than corrected mean positions; several faint stack rows also have missing point-source diagnostics. QAC deliberately excludes stack-only and uncorrected mean sources, so `-m 15 22` is a magnitude *ceiling*, not a promise of complete reference coverage to r=22. A future stack-only mode would need separate uncertainty weighting and validation against corrected mean stars; it cannot be pooled into the current fit as equally precise references.
+At r≈22, some Pan-STARRS detections exist only in the [stack catalogue](https://catalogs.mast.stsci.edu/docs/panstarrs.html). Their `raStack`/`decStack` positions do not have the same Gaia EDR3 correction and can have larger systematic errors than corrected mean positions; several faint stack rows also have missing point-source diagnostics. QUAC deliberately excludes stack-only and uncorrected mean sources, so `-m 15 22` is a magnitude *ceiling*, not a promise of complete reference coverage to r=22. A future stack-only mode would need separate uncertainty weighting and validation against corrected mean stars; it cannot be pooled into the current fit as equally precise references.
 
-Gaia initially queries to magnitude 18.5 and extends to 20 for sparse or weak matches. Dense automatic queries narrow the faint limit to avoid the archive's 2,000-row synchronous cap; an explicit range that reaches the cap produces an error. QAC matches the brightest catalogue stars first, then tries progressively fainter groups and refits using all accepted matches. Initial matching considers up to 200 image detections for Pan-STARRS/AllWISE and 80 for other catalogues, allowing counterparts below unrelated bright detections. These are heuristic search budgets, not limits on final matched-star counts. Gaia results are cached in `~/.cache/qac` (or `$XDG_CACHE_HOME/qac`); `--refresh-catalog` bypasses that cache and affects only Gaia. The other remote catalogues retain their existing Astroquery/service cache behavior and per-run reuse; UCAC5 reused positions are keyed by observation date. Gaia proper motions are propagated from J2016.0 to `DATE-OBS` or `MJD-OBS` when available. AllWISE, 2MASS, and local positions are not propagated.
+Gaia initially queries to magnitude 18.5 and extends to 20 for sparse or weak matches. Dense automatic queries narrow the faint limit to avoid the archive's 2,000-row synchronous cap; an explicit range that reaches the cap produces an error. QUAC matches the brightest catalogue stars first, then tries progressively fainter groups and refits using all accepted matches. Initial matching considers up to 200 image detections for Pan-STARRS/AllWISE and 80 for other catalogues, allowing counterparts below unrelated bright detections. These are heuristic search budgets, not limits on final matched-star counts. Gaia results are cached in `~/.cache/qac` (or `$XDG_CACHE_HOME/qac`); `--refresh-catalog` bypasses that cache and affects only Gaia. The other remote catalogues retain their existing Astroquery/service cache behavior and per-run reuse; UCAC5 reused positions are keyed by observation date. Gaia proper motions are propagated from J2016.0 to `DATE-OBS` or `MJD-OBS` when available. AllWISE, 2MASS, and local positions are not propagated.
 
 A local text catalogue contains `RA DEC [MAG]` on each line, separated by spaces or commas. A `RA DEC` header and `#` comments are allowed. Coordinates may be decimal degrees or colon-separated sexagesimal (RA in hours). Synthetic example coordinates:
 
@@ -155,21 +157,21 @@ RA DEC MAG
 
 `-f/--flip x`, `y`, or `xy` tries that virtual reversal. Bare `-f` tries normal and all three reversals, selecting the best match. The saved WCS refers to the **original pixel layout**.
 
-For BFOSC the default Y flip is virtual: QAC writes the fitted WCS against the original image pixels.
+For BFOSC the default Y flip is virtual: QUAC writes the fitted WCS against the original image pixels.
 
-Without `-d`, QAC fits a linear TAN WCS. Bare `-d/--distortion/--distorsion` fits degree-2 SIP; `-d 3` fits degree 3. The legacy spelling `--distorsion` remains an alias. SIP is fitted in detector pixels after the initial match. Degree 2 requires at least 25 well-spread stars, degree 3 at least 40; held-out stars validate the fit. An unsuccessful explicit SIP fit marks that frame as failed; other selected frames are still attempted. A single-frame failure, or a run in which every selected frame fails, writes no output.
+Without `-d`, QUAC fits a linear TAN WCS. Bare `-d/--distortion/--distorsion` fits degree-2 SIP; `-d 3` fits degree 3. The legacy spelling `--distorsion` remains an alias. SIP is fitted in detector pixels after the initial match. Degree 2 requires at least 25 well-spread stars, degree 3 at least 40; held-out stars validate the fit. An unsuccessful explicit SIP fit marks that frame as failed; other selected frames are still attempted. A single-frame failure, or a run in which every selected frame fails, writes no output.
 
 `--resample` implies degree-2 SIP unless `-d 3` is given. It maps pixels by bilinear interpolation onto a same-size TAN grid and applies a local pixel-area correction for count-per-pixel images. Blank or uncovered pixels become NaN; output pixels are floating point. Interpolation changes sharp features and noise, and the fixed-size grid can lose a narrow edge strip. The area correction is inappropriate for surface-brightness-per-solid-angle images: use a SIP-header output instead.
 
 ## FITS output and frames
 
-One 2-D image is solved directly, including an image extension behind an empty primary HDU. Multiple images or a 3-D stack require `-q/--cube`, except that `-i mods` automatically selects a uniquely named `MERGED` image when no `-q` was supplied. Current Archon MODS files contain four raw image extensions (`IM1`–`IM4`), a status table, and `MERGED` in HDU 6: QAC calls `MERGED` **image frame 5** and writes only that frame. If there is no unique `MERGED` image, give `-q` explicitly; the instrument option never guesses from the extension number.
+One 2-D image is solved directly, including an image extension behind an empty primary HDU. Multiple images or a 3-D stack require `-q/--cube`, except that `-i mods` automatically selects a uniquely named `MERGED` image when no `-q` was supplied. Current Archon MODS files contain four raw image extensions (`IM1`–`IM4`), a status table, and `MERGED` in HDU 6: QUAC calls `MERGED` **image frame 5** and writes only that frame. If there is no unique `MERGED` image, give `-q` explicitly; the instrument option never guesses from the extension number.
 
 Bare `-q` solves all image frames; for a stack, it writes independent 2-D extensions. `-q N` solves **only** 1-based image frame N and writes one standalone 2-D primary image; empty and table HDUs are skipped in the count. `-q EXTNAME` selects a uniquely named image extension. Any explicit `-q` overrides MODS automatic selection. A selected plane is also written as one standalone image.
 
-The default file is `INPUT_astro.fits`, or `INPUT_resampled.fits` with `--resample`; a single selected frame inserts `_qN`, for example `INPUT_q5_astro.fits`. `-o PATH` chooses an output path and `--overwrite` permits replacing an existing output file. The input itself is never overwritten. QAC attempts every selected frame, continuing after expected source-detection, catalogue, matching, fitting, or resampling failures. If at least one frame succeeds, it stages the output FITS and any requested PNG pages, then publishes them after writing and rendering succeed. All selected readable images remain in the output: successful frames receive their new WCS, while failed frames retain their input pixels and unverified input WCS. Per-frame match counts, RMS, fitted scales, and failure reasons are printed.
+The default file is `INPUT_astro.fits`, or `INPUT_resampled.fits` with `--resample`; a single selected frame inserts `_qN`, for example `INPUT_q5_astro.fits`. `-o PATH` chooses an output path and `--overwrite` permits replacing an existing output file. The input itself is never overwritten. QUAC attempts every selected frame, continuing after expected source-detection, catalogue, matching, fitting, or resampling failures. If at least one frame succeeds, it stages the output FITS and any requested PNG pages, then publishes them after writing and rendering succeed. All selected readable images remain in the output: successful frames receive their new WCS, while failed frames retain their input pixels and unverified input WCS. Per-frame match counts, RMS, fitted scales, and failure reasons are printed.
 
-Every selected image has `QACSTAT = SOLVED` or `FAILED`, `QACVER`, and `QACRSMP` (whether its pixels were resampled in this run). Failed frames also have `QACERR`; old failure messages are removed from successful frames. Check `QACSTAT` before using a frame's WCS as a QAC calibration. The primary header summarizes the run with `QACRUN = COMPLETE` or `PARTIAL`, `QACNSEL` (selected), `QACNSOL` (solved), and `QACNFAI` (failed). With `--resample`, successful frames are rectified but failed frames retain their native pixels, even in an output named `_resampled.fits`; `QACRSMP` distinguishes them.
+Every selected image has `QACSTAT = SOLVED` or `FAILED`, `QACVER`, and `QACRSMP` (whether its pixels were resampled in this run). Failed frames also have `QACERR`; old failure messages are removed from successful frames. Check `QACSTAT` before using a frame's WCS as a QUAC calibration. The primary header summarizes the run with `QACRUN = COMPLETE` or `PARTIAL`, `QACNSEL` (selected), `QACNSOL` (solved), and `QACNFAI` (failed). With `--resample`, successful frames are rectified but failed frames retain their native pixels, even in an output named `_resampled.fits`; `QACRSMP` distinguishes them.
 
 Exit status is **0** for complete success, **1** for a saved partial result, and **2** when no frames solve or a handled input/output/rendering error prevents saving the requested result. Partial completion prints `PARTIAL SUCCESS: N/T frames solved`. No output is published if all selected frames fail. Unreadable input data that cannot be preserved, invalid common options, and output writing/rendering failures remain fatal.
 
@@ -191,7 +193,7 @@ Residuals are observed minus reference in arcseconds. Radial RMS is the square r
 
 Plots reuse accepted matches without another catalogue query or fit. PNG creation works without a graphical display. At least one frame must solve and all requested pages must render before publication; `--overwrite` covers every output, but replacing multiple files is not one filesystem transaction.
 
-After publication, QAC tries to open each PNG using `xdg-open` (Linux), `open` (macOS), or the Windows file handler without waiting for the viewer to close. A graphical session and configured viewer are needed to see a window; opener failures leave saved files and calibration exit status intact.
+After publication, QUAC tries to open each PNG using `xdg-open` (Linux), `open` (macOS), or the Windows file handler without waiting for the viewer to close. A graphical session and configured viewer are needed to see a window; opener failures leave saved files and calibration exit status intact.
 
 ## Limits
 

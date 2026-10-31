@@ -1,5 +1,14 @@
 # Changelog
 
+## 10.0.1 — 2026-10-31
+
+- Fix the neighbour diagnostic's production import and source-checksum path after the QUAC rename. Update the Observer role's executable reference; astrometric calculations and historical records are unchanged.
+
+## 10.0.0 — 2026-10-31
+
+- Rename the tool and executable to QUAC (`quac.py`), with `quac-vVERSION` release folders and ZIPs. Update current documentation and executable references; retain existing FITS QAC keywords and Gaia cache location for compatibility. The executable rename increases the major version.
+- QUAC means Quick Astrometry for FITS images and Cubes.
+
 ## 9.2.4 — 2026-10-30
 
 - Restore the single-frame right column to a readable statistics block above side-by-side residual scatter and vector graphs. Preserve the left-aligned field, fonts, measurements and combined layouts.
