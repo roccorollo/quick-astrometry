@@ -1,4 +1,4 @@
-# QUAC v10.0.1 — Quick Astrometry for FITS Images
+# QUAC v10.2.0 — Quick Astrometry for FITS Images
 
 <p align="center">
   <img src="images/example_badpointing.png" 
@@ -17,6 +17,8 @@ License: [MIT](LICENSE).
 QUAC refines image astrometry against Gaia DR3, Pan-STARRS DR2 (PS1), 2MASS, AllWISE, UCAC5, GSC 3.3, or a local RA/Dec catalogue. Gaia DR3 remains the default. It writes a fitted TAN WCS, optionally with SIP distortion. The original pixels are retained unless `--resample` resamples them onto an undistorted TAN grid. Python 3.10+ is required.
 
 ## Install and run
+
+`quac.py` is the generated standalone release: copy it and install the same dependencies as before. It does not require the `development` folder at runtime.
 
 Use Python 3.10+ with the requirements below. Set `RA` and `DEC` to your approximate field centre (degrees or sexagesimal), and `SCALE` to your pixel scale in arcsec/pixel.
 
@@ -40,7 +42,7 @@ Remote catalogues need internet access for uncached queries; local catalogues wo
 Terminal and plot reports show the solved image centre in HMS/DMS and field width × height to one decimal place. FOV uses arcseconds when both sides are below 1 arcmin, degrees when both exceed 50 arcmin, and arcminutes otherwise. Sizes span opposite image-edge midpoints before diagnostic rotation/padding; failed frames have no solved geometry report.
 
 Plots use DejaVu Sans at 9, 13 and 15 points. The filename is emphasized over the QUAC heading; centre/FOV text uses the same size as the solution summary.
-The header places image information on the left and solution metadata on the right. Single-frame plots use a wider field and vertically stacked residual graphs; multi-frame plots retain per-panel centre/FOV labels and the per-frame quality table.
+The header places image information on the left and solution metadata on the right. Single-frame plots use a wider field and side-by-side residual graphs; multi-frame plots retain per-panel centre/FOV labels and the per-frame quality table.
 
 QUAC uses the same stellar FWHM procedure on native and binned images. Background boxes target 256 working pixels, shrinking on small images. A single segmentation supplies region areas; a rough width population sets the minimum candidate area, while smaller regions remain possible neighbours. Isolated candidates receive an elliptical-Gaussian fit after a separate local sky-plane estimate, using an analytical Jacobian. Up to 80 bright candidates are fitted; at least 12 accepted profiles are required. Isolation is checked against both preliminary and fitted widths, and cutouts can enlarge once when necessary. The image-derived width range is bounded by a 100-working-pixel safety limit and image size. See [source analysis](SOURCE_ANALYSIS.md) for assumptions and safeguards.
 
@@ -201,4 +203,20 @@ The matcher needs enough reference stars near a trial field. With a supplied sca
 
 ## Checks
 
-Run the offline CLI checks with `python -m unittest discover -s tests -p 'test_cli_options.py'`. The complete offline regression and plotting suite also requires `pytest` and can be run with `python -m pytest tests`.
+Run the offline CLI checks with `python -m unittest discover -s development/tests -p 'test_cli_options.py'`. The complete offline regression and plotting suite also requires `pytest` and can be run with `python -m pytest development/tests`.
+
+## Development and releases
+
+Edit **`development/quaclib/`**, the single source of truth; do not edit generated `quac.py`. The modules separate shared definitions, catalogues, FITS input, detection, geometry, pair/triangle/SCAMP matching, WCS fitting, output, plotting, orchestration and CLI. SCAMP remains internal and unavailable as a CLI strategy.
+
+```bash
+python -m development.quaclib --help                  # run the modular implementation
+python development/tools/build_standalone.py          # regenerate standalone quac.py
+python development/tools/build_standalone.py --check  # verify it matches the modules
+python development/tools/build_standalone.py --release dist  # generate folder and ZIP
+python -m pytest -q development/tests                 # standalone regression suite
+QUAC_TEST_FORM=modular python -m pytest -q development/tests  # same suite against modules
+```
+
+The builder uses only the Python standard library, preserves function bodies and orders explicit module dependencies. Releases include both editable sources and the standalone script; their curated contents are listed in `development/tools/release_files.txt`. Build verification checks reproducibility, isolated standalone execution and the pre-refactor algorithm baseline. Keep Python 3.10 and 3.12 checks for both forms.
+

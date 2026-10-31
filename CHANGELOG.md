@@ -1,5 +1,16 @@
 # Changelog
 
+## 10.2.0 — 2026-10-31
+
+- Group canonical sources, build tools and tests under `development/`, updating modular invocation, generation, test discovery and release paths. Keep generated `quac.py`, requirements and project documentation at the root; benchmarks, diagnostics and images are not moved.
+- Preserve the standalone interface, scientific routines and dependencies. This compatible development-workflow change increases the minor version.
+
+## 10.1.0 — 2026-10-31
+
+- Move the existing implementation into canonical `quaclib` modules and add `python -m quaclib`. Preserve scientific function bodies, options, instrument presets, caches, FITS metadata and output policy.
+- Generate portable `quac.py` deterministically with `tools/build_standalone.py`; add freshness checking and versioned release-folder/ZIP generation without additional dependencies. Keep the standalone executable usable without the modules and exclude `SCAMP_MATCHING.md` from releases.
+- Exercise the same regression suite against both forms and compare algorithm ASTs with v10.0.1. This compatible development/release workflow increases the minor version.
+
 ## 10.0.1 — 2026-10-31
 
 - Fix the neighbour diagnostic's production import and source-checksum path after the QUAC rename. Update the Observer role's executable reference; astrometric calculations and historical records are unchanged.
