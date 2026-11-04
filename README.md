@@ -1,4 +1,4 @@
-# QUAC v10.2.0 — Quick Astrometry for FITS Images
+# QUAC v10.3.0 — Quick Astrometry for FITS Images
 
 <p align="center">
   <img src="images/example_badpointing.png" 
@@ -132,6 +132,8 @@ In normal mode, `-i` starts with a smaller catalogue cone around the footprint c
 The default catalogue is Gaia DR3 in RP with **12 ≤ RP < 20**. `-s/--survey` (also `--catalog`) selects Gaia DR3, Pan-STARRS DR2, 2MASS, AllWISE, UCAC5, GSC 3.3, or a local RA/Dec text file. `-s pan-starrs` (or `-s ps`; legacy `-s ps1` also works) uses Pan-STARRS DR2 mean astrometry and r-band mean PSF magnitude with **15 ≤ r < 21** by default; `-b` accepts g/r/i/z/y. `-s 2mass` uses J with **12 ≤ J < 15.8** by default; H and Ks default to faint limits of 15.1 and 14.3. `-s allwise` (or `-s aw`) defaults to **8 ≤ W1 < 16**. `-s ucac5` (or `-s uc`) defaults to **8 ≤ G < 16**. `-s gsc3.3` (or `-s gsc`) defaults to **12 ≤ mag < 20**. `-m FAINT` changes only the faint limit, retaining that catalogue/band's default bright cut; `-m BRIGHT FAINT` changes both. Bounds are inclusive at the bright end and exclusive at the faint end. The limits are selection cuts, not completeness guarantees.
 
 AllWISE `-b` accepts W1/W2/W3/W4, with default ranges of 8–16, 7–15, 4–11, and 0–8 respectively. UCAC5 `-b` accepts G/R/J/H/Ks; its default bright limit is 8 in all bands, with faint limits of 16, 16, 15.8, 15.1, and 14.3. Gaia G/BP/RP, Pan-STARRS g/r/i/z/y, and 2MASS J/H/Ks band selection is unchanged; `K` is also accepted for `Ks`.
+
+Remote-service failures trigger automatic fallback: Gaia DR3 tries [ARI Heidelberg](https://gaia.ari.uni-heidelberg.de/tap.html) after ESA; 2MASS, AllWISE and UCAC5 try the configured VizieR server, then Harvard and Japan. 2MASS and AllWISE additionally try [IRSA](https://irsa.ipac.caltech.edu/docs/program_interface/TAP.html). Catalogue releases, magnitude limits and quality cuts are preserved; empty results and row-limit errors do not trigger another server. Pan-STARRS and GSC are unchanged. Each fallback is reported in the terminal.
 
 AllWISE queries [VizieR II/328/allwise](https://cdsarc.cds.unistra.fr/viz-bin/ReadMe/II/328?format=html&tex=true). It uses the recommended stationary `RAJ2000`/`DEJ2000` positions, not the motion-fit positions. Astrometric references require quality A in W1 and the selected band, no flagged artifacts or saturated pixels in those bands, no extended-source flag, one fitted component, no active deblending, and a finite error-ellipse semi-major axis of at most 0.3 arcsec. The [AllWISE apparent motions mix proper motion and parallax](https://irsa.ipac.caltech.edu/data/WISE/docs/release/AllWISE/expsup/sec2_1.html), so QUAC does not propagate them to the observing date. Optical/infrared source differences, blending, and uncorrected stellar motion can limit agreement with an optical image.
 

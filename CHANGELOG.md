@@ -1,5 +1,10 @@
 # Changelog
 
+## 10.3.0 — 2026-11-04
+
+- Add automatic catalogue-service recovery: ESA Gaia DR3 → ARI; configured VizieR → Harvard → Japan; then IRSA for 2MASS and AllWISE. Preserve releases, magnitude cuts, quality selection, proper-motion handling, Gaia cache keys and row caps. Report attempted fallbacks and combined failures.
+- Reuse provider selection and shared transport without new dependencies or CLI options; leave Pan-STARRS and GSC unchanged.
+
 ## 10.2.0 — 2026-10-31
 
 - Group canonical sources, build tools and tests under `development/`, updating modular invocation, generation, test discovery and release paths. Keep generated `quac.py`, requirements and project documentation at the root; benchmarks, diagnostics and images are not moved.
